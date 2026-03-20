@@ -1,0 +1,586 @@
+// ==UserScript==
+// @name         PokeRogue Cheat Menu
+// @namespace    https://github.com/Eli-Zac/PokeRogue-Cheat-Menu
+// @version      1.5
+// @description  Cheat menu for PokeRogue
+// @author       Eli_Zac
+// @match        *://pokerogue.net/*
+// @match        *://www.pokerogue.net/*
+// @match        *://play.pokerogue.net/*
+// @match        *://playpokerogue.com/*
+// @match        *://www.playpokerogue.com/*
+// @grant        unsafeWindow
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const uw = (typeof window !== 'undefined' && window.wrappedJSObject)
+    ? window.wrappedJSObject
+    : unsafeWindow;
+
+  const TOGGLE_KEY = 'F2';
+  let guiVisible = false;
+  let activeSection = null;
+
+  // ─── PHASER ACCESS ───────────────────────────────────────────────────────
+
+  let _game = null;
+
+  function hookPhaserConstructor() {
+    if (!uw.Phaser?.Game || uw.Phaser.Game.__prHooked) return;
+    const Orig = uw.Phaser.Game;
+    uw.Phaser.Game = function (...args) {
+      const inst = new Orig(...args);
+      _game = inst;
+      return inst;
+    };
+    uw.Phaser.Game.prototype = Orig.prototype;
+    uw.Phaser.Game.__prHooked = true;
+    Object.keys(Orig).forEach(k => { try { uw.Phaser.Game[k] = Orig[k]; } catch (_) {} });
+  }
+
+  function getPhaserGame() {
+    if (_game?.scene) return _game;
+    let keys = [];
+    try { keys = Object.getOwnPropertyNames(uw); } catch (_) {
+      try { keys = Object.keys(uw); } catch (_) {}
+    }
+    for (const k of keys) {
+      try {
+        const v = uw[k];
+        if (v?.scene && Array.isArray(v.scene.scenes) && v.scene.scenes.length > 0 && v.renderer) {
+          _game = v; return _game;
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  function findGameScene() {
+    return getPhaserGame()?.scene?.scenes?.find(sc => sc?.gameData) ?? null;
+  }
+
+  function findGachaHandler() {
+    const scene = findGameScene();
+    if (!scene?.ui) return null;
+    for (const k of Object.keys(scene.ui)) {
+      try {
+        const v = scene.ui[k];
+        if (!v) continue;
+        if (typeof v.updateVoucherCounts === 'function') return v;
+        if (Array.isArray(v)) {
+          for (const h of v) {
+            if (h && typeof h.updateVoucherCounts === 'function') return h;
+          }
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  function findGameData() {
+    if (uw.globalScene?.gameData) return uw.globalScene.gameData;
+    return findGameScene()?.gameData ?? null;
+  }
+
+  if (uw.Phaser) hookPhaserConstructor();
+  else {
+    let attempts = 0;
+    const iv = setInterval(() => {
+      if (uw.Phaser) { hookPhaserConstructor(); clearInterval(iv); }
+      if (++attempts > 100) clearInterval(iv);
+    }, 100);
+  }
+
+  // ─── VOUCHER HACKS ───────────────────────────────────────────────────────
+
+  function getVoucherCounts() {
+    const gd = findGameData();
+    if (!gd?.voucherCounts) return null;
+    return [0, 1, 2, 3].map(i => gd.voucherCounts[i] ?? 0);
+  }
+
+  function setVoucherCounts(values) {
+    const gd = findGameData();
+    if (!gd?.voucherCounts) return false;
+    const vals = Array.isArray(values) ? values : [values, values, values, values];
+    for (let i = 0; i < 4; i++) gd.voucherCounts[i] = Math.max(0, Math.floor(vals[i]));
+    const handler = findGachaHandler();
+    if (handler && typeof handler.updateVoucherCounts === 'function') handler.updateVoucherCounts();
+    return true;
+  }
+
+  // ─── EGG LIMIT HACK ──────────────────────────────────────────────────────
+  // Patches processInput on the gacha handler to temporarily swap a fake
+  // eggs array (length=0) onto gameData for the duration of the synchronous
+  // cap check only. Restored in finally{} before anything else runs.
+  // The egg list screen uses a separate code path and is never affected.
+
+  let _eggLimitRemoved = false;
+  let _eggPatchInstalled = false;
+  let _origProcessInput = null;
+  let _patchedHandler = null;
+
+  function installProcessInputPatch() {
+    if (_eggPatchInstalled) return true;
+    const handler = findGachaHandler();
+    if (!handler || typeof handler.processInput !== 'function') return false;
+
+    _origProcessInput = handler.processInput;
+    _patchedHandler = handler;
+
+    handler.processInput = function (button) {
+      if (!_eggLimitRemoved) return _origProcessInput.call(this, button);
+
+      const gd = findGameData();
+      if (!gd) return _origProcessInput.call(this, button);
+
+      const real = gd.eggs;
+      const fake = new Proxy(real, {
+        get(t, p) {
+          if (p === 'length') return 0;
+          const v = t[p];
+          return typeof v === 'function' ? v.bind(t) : v;
+        },
+        set(t, p, v) { t[p] = v; return true; }
+      });
+
+      try {
+        Object.defineProperty(gd, 'eggs', {
+          get: () => fake, set: (v) => { gd._eggsReal = v; },
+          configurable: true, enumerable: true,
+        });
+      } catch (_) { gd.eggs = fake; }
+
+      let result;
+      try {
+        result = _origProcessInput.call(this, button);
+      } finally {
+        try {
+          Object.defineProperty(gd, 'eggs', {
+            value: real, writable: true, configurable: true, enumerable: true,
+          });
+        } catch (_) { gd.eggs = real; }
+      }
+      return result;
+    };
+
+    _eggPatchInstalled = true;
+    return true;
+  }
+
+  function setEggLimitRemoved(enabled) {
+    if (enabled && !_eggPatchInstalled) {
+      if (!installProcessInputPatch()) return false;
+    }
+    _eggLimitRemoved = enabled;
+    return true;
+  }
+
+  function getEggCount() {
+    const gd = findGameData();
+    return gd?.eggs?.length ?? null;
+  }
+
+  // ─── TOAST ───────────────────────────────────────────────────────────────
+
+  function showToast(message, isError = false) {
+    const ex = document.getElementById('pr-toast');
+    if (ex) ex.remove();
+    const t = document.createElement('div');
+    t.id = 'pr-toast';
+    t.textContent = message;
+    Object.assign(t.style, {
+      position: 'fixed', bottom: '80px', right: '24px',
+      background: isError ? '#3d0f0f' : '#0d2e1a',
+      color: isError ? '#fca5a5' : '#86efac',
+      border: '1px solid ' + (isError ? '#dc2626' : '#22c55e'),
+      borderRadius: '8px', padding: '11px 16px',
+      fontFamily: "'Share Tech Mono', monospace", fontSize: '13px',
+      zIndex: '999999', opacity: '0', transition: 'opacity 0.2s',
+      pointerEvents: 'none', maxWidth: '320px', lineHeight: '1.4',
+    });
+    document.body.appendChild(t);
+    requestAnimationFrame(() => { t.style.opacity = '1'; });
+    setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); }, 3000);
+  }
+
+  // ─── SECTIONS ────────────────────────────────────────────────────────────
+
+  const SECTIONS = [
+    {
+      id: 'eggs',
+      icon: '🥚',
+      label: 'Eggs',
+      description: 'Vouchers, pull limits & egg storage',
+      buildContent(container) {
+        container.innerHTML = `
+          <div class="pr-card">
+            <div class="pr-card-header">
+              <div class="pr-card-title">Voucher Counts</div>
+              <div class="pr-card-desc">Set how many of each voucher type you have</div>
+            </div>
+            <div class="pr-voucher-grid">
+              <div class="pr-voucher-card">
+                <span class="pr-voucher-tier">Regular</span>
+                <span class="pr-voucher-val" id="pv-cur-0">—</span>
+                <input class="pr-input" id="pv-in-0" type="number" min="0" max="9999" placeholder="new value">
+              </div>
+              <div class="pr-voucher-card">
+                <span class="pr-voucher-tier">Plus</span>
+                <span class="pr-voucher-val" id="pv-cur-1">—</span>
+                <input class="pr-input" id="pv-in-1" type="number" min="0" max="9999" placeholder="new value">
+              </div>
+              <div class="pr-voucher-card">
+                <span class="pr-voucher-tier">Premium</span>
+                <span class="pr-voucher-val" id="pv-cur-2">—</span>
+                <input class="pr-input" id="pv-in-2" type="number" min="0" max="9999" placeholder="new value">
+              </div>
+              <div class="pr-voucher-card">
+                <span class="pr-voucher-tier gold">✦ Golden</span>
+                <span class="pr-voucher-val gold" id="pv-cur-3">—</span>
+                <input class="pr-input" id="pv-in-3" type="number" min="0" max="9999" placeholder="new value">
+              </div>
+            </div>
+            <div class="pr-btn-row">
+              <button class="pr-btn green" id="pr-apply">✓ Apply</button>
+              <button class="pr-btn purple" id="pr-max">▲ Set 999</button>
+              <button class="pr-btn red" id="pr-zero">▼ Set 0</button>
+            </div>
+          </div>
+
+          <div class="pr-card">
+            <div class="pr-toggle-row" id="pr-egg-limit-row">
+              <div class="pr-toggle-info">
+                <div class="pr-toggle-name">Remove Egg Limit</div>
+                <div class="pr-toggle-status" id="pr-egg-count-display">—</div>
+              </div>
+              <label class="pr-toggle">
+                <input type="checkbox" id="pr-egg-limit-toggle">
+                <span class="pr-slider"></span>
+              </label>
+            </div>
+          </div>
+        `;
+
+        const applyVouchers = () => {
+          const counts = getVoucherCounts();
+          if (!counts) { showToast('⚠️ Open the Gacha menu first', true); return; }
+          const vals = [0, 1, 2, 3].map(i => {
+            const raw = container.querySelector('#pv-in-' + i).value;
+            return raw === '' ? counts[i] : Math.max(0, parseInt(raw, 10) || 0);
+          });
+          if (setVoucherCounts(vals)) {
+            showToast('✅ Vouchers updated!');
+            [0, 1, 2, 3].forEach(i => { container.querySelector('#pv-in-' + i).value = ''; });
+          }
+        };
+
+        container.querySelector('#pr-apply').addEventListener('click', applyVouchers);
+        container.querySelector('#pr-max').addEventListener('click', () => {
+          if (setVoucherCounts(999)) showToast('✅ All vouchers set to 999');
+          else showToast('⚠️ Open the Gacha menu first', true);
+        });
+        container.querySelector('#pr-zero').addEventListener('click', () => {
+          if (setVoucherCounts(0)) showToast('✅ All vouchers set to 0');
+          else showToast('⚠️ Open the Gacha menu first', true);
+        });
+
+        container.querySelectorAll('.pr-input').forEach(inp => {
+          inp.addEventListener('keydown', e => {
+            if (e.key === 'Enter') applyVouchers();
+            e.stopPropagation();
+          });
+        });
+
+        const limitToggle = container.querySelector('#pr-egg-limit-toggle');
+        const limitRow = container.querySelector('#pr-egg-limit-row');
+        limitToggle.checked = _eggLimitRemoved;
+        if (_eggLimitRemoved) limitRow.classList.add('active');
+
+        limitToggle.addEventListener('change', () => {
+          const ok = setEggLimitRemoved(limitToggle.checked);
+          if (ok) {
+            limitRow.classList.toggle('active', limitToggle.checked);
+            showToast(limitToggle.checked ? '✅ Egg limit removed!' : '🔒 Egg limit restored');
+          } else {
+            limitToggle.checked = false;
+            showToast('⚠️ Open the Gacha menu first', true);
+          }
+        });
+
+        const curEls = [0, 1, 2, 3].map(i => container.querySelector('#pv-cur-' + i));
+        const eggCountEl = container.querySelector('#pr-egg-count-display');
+
+        return function tick() {
+          const counts = getVoucherCounts();
+          curEls.forEach((el, i) => { el.textContent = counts ? counts[i] : '—'; });
+          const ec = getEggCount();
+          if (ec !== null) {
+            eggCountEl.textContent = ec + ' egg' + (ec !== 1 ? 's' : '') + ' stored' +
+              (_eggLimitRemoved ? '  •  limit off' : '  •  99 max');
+          } else {
+            eggCountEl.textContent = 'open Gacha menu to connect';
+          }
+        };
+      }
+    },
+    // add more sections here
+  ];
+
+  // ─── GUI ─────────────────────────────────────────────────────────────────
+
+  let _sectionTick = null;
+  let _statusTimer = null;
+
+  function buildGUI() {
+    const overlay = document.createElement('div');
+    overlay.id = 'pr-cheat-gui';
+
+    const style = document.createElement('style');
+
+    const css = [
+      "@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@700&display=swap');",
+
+      // overlay
+      '#pr-cheat-gui{position:fixed;inset:0;z-index:999998;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.72);backdrop-filter:blur(12px);animation:pr-in .15s ease}',
+      '@keyframes pr-in{from{opacity:0;transform:scale(.95)}to{opacity:1;transform:scale(1)}}',
+
+      // panel
+      '#pr-panel{background:#0f1219;border:1px solid #2e3a52;border-radius:16px;width:560px;max-height:88vh;display:flex;flex-direction:column;box-shadow:0 0 0 1px #1a2235,0 32px 80px rgba(0,0,0,.95);overflow:hidden;font-family:"Share Tech Mono",monospace}',
+
+      // titlebar
+      '#pr-bar{background:linear-gradient(160deg,#161d2e 0%,#0f1219 100%);border-bottom:1px solid #2e3a52;padding:14px 16px;display:flex;align-items:center;justify-content:space-between;user-select:none;flex-shrink:0;gap:10px}',
+      '#pr-bar-left{display:flex;align-items:center;gap:10px;flex:1;min-width:0}',
+      '#pr-back{background:none;border:1px solid #2e3a52;border-radius:6px;color:#7c8fff;cursor:pointer;width:28px;height:28px;display:none;align-items:center;justify-content:center;font-size:20px;line-height:1;transition:all .15s;flex-shrink:0}',
+      '#pr-back:hover{border-color:#7c8fff;background:#1a2040}',
+      '#pr-back.visible{display:flex}',
+      '#pr-bar-title{font-family:"Orbitron",monospace;font-size:16px;font-weight:700;color:#7c8fff;letter-spacing:.14em;text-transform:uppercase}',
+      '#pr-bar-sub{font-size:15px;color:#8a9ab8;margin-top:3px;letter-spacing:.1em;text-transform:uppercase}',
+      '#pr-close{background:none;border:1px solid #2e3a52;border-radius:6px;color:#6b7fa0;cursor:pointer;width:28px;height:28px;display:flex;align-items:center;justify-content:center;font-size:17px;line-height:1;transition:all .15s;flex-shrink:0}',
+      '#pr-close:hover{border-color:#f87171;color:#f87171;background:#2d1010}',
+
+      // body
+      '#pr-body{flex:1;overflow-y:auto;min-height:0}',
+      '#pr-body::-webkit-scrollbar{width:3px}',
+      '#pr-body::-webkit-scrollbar-thumb{background:#2e3a52;border-radius:2px}',
+
+      // home
+      '#pr-home{padding:14px;display:flex;flex-direction:column;gap:8px}',
+      '.pr-home-label{font-size:15px;color:#8a9ab8;letter-spacing:.18em;text-transform:uppercase;padding:2px 4px;margin-bottom:2px}',
+      '.pr-category-btn{display:flex;align-items:center;gap:14px;background:#141b28;border:1px solid #2a3650;border-radius:12px;padding:16px 14px;cursor:pointer;width:100%;text-align:left;transition:all .18s}',
+      '.pr-category-btn:hover{border-color:#7c8fff;background:#181f30;transform:translateX(2px)}',
+      '.pr-category-btn:active{transform:scale(.99)}',
+      '.pr-cat-icon{font-size:26px;flex-shrink:0;width:34px;text-align:center;line-height:1}',
+      '.pr-cat-info{flex:1;min-width:0}',
+      '.pr-cat-label{font-family:"Orbitron",monospace;font-size:15px;color:#c4ccff;letter-spacing:.08em;text-transform:uppercase;margin-bottom:5px}',
+      '.pr-cat-desc{font-size:15px;color:#9aaac0;line-height:1.4}',
+      '.pr-cat-arrow{color:#4a5e80;font-size:24px;flex-shrink:0;transition:all .18s;line-height:1}',
+      '.pr-category-btn:hover .pr-cat-arrow{color:#7c8fff;transform:translateX(3px)}',
+
+      // section
+      '#pr-section{padding:14px;display:none;flex-direction:column;gap:10px}',
+      '#pr-section.visible{display:flex}',
+
+      // cards
+      '.pr-card{background:#141b28;border:1px solid #2a3650;border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:12px}',
+      '.pr-card-header{display:flex;flex-direction:column;gap:4px;padding-bottom:12px;border-bottom:1px solid #1e2d40}',
+      '.pr-card-title{font-size:18px;color:#d0d8f0;letter-spacing:.03em}',
+      '.pr-card-desc{font-size:15px;color:#8a9ab8;line-height:1.5}',
+
+      // voucher grid
+      '.pr-voucher-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}',
+      '.pr-voucher-card{background:#0f1219;border:1px solid #2a3650;border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:8px;transition:border-color .15s;overflow:hidden}',
+      '.pr-voucher-card:focus-within{border-color:#7c8fff}',
+      '.pr-voucher-tier{font-size:13px;color:#9aaac0;letter-spacing:.12em;text-transform:uppercase}',
+      '.pr-voucher-tier.gold{color:#a07820}',
+      '.pr-voucher-val{font-size:24px;color:#7c8fff;font-weight:700;line-height:1.15;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.pr-voucher-val.gold{color:#f0b429}',
+      '.pr-input{background:#1a2235;border:1px solid #2a3650;border-radius:6px;color:#e0e8ff;font-family:"Share Tech Mono",monospace;font-size:15px;padding:7px 9px;width:100%;box-sizing:border-box;outline:none;transition:border-color .15s,background .15s}',
+      '.pr-input:focus{border-color:#7c8fff;background:#1e2840}',
+      '.pr-input::placeholder{color:#4e6080}',
+      '.pr-input::-webkit-outer-spin-button,.pr-input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}',
+      '.pr-input[type=number]{-moz-appearance:textfield}',
+
+      // buttons
+      '.pr-btn-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}',
+      '.pr-btn{background:#1a2235;border:1px solid #2a3650;border-radius:8px;padding:11px 10px;cursor:pointer;font-family:"Share Tech Mono",monospace;font-size:16px;color:#7a8aaa;transition:all .15s;text-align:center;white-space:nowrap}',
+      '.pr-btn:hover{background:#1e2840;color:#e0e8ff;border-color:#4a5a80}',
+      '.pr-btn:active{transform:scale(.97)}',
+      '.pr-btn.green{color:#4ade80;border-color:#1a4030;background:#0e1e14}',
+      '.pr-btn.green:hover{background:#142a1e;border-color:#22c55e;color:#86efac}',
+      '.pr-btn.purple{color:#c4b5fd;border-color:#3730a3;background:#12102e}',
+      '.pr-btn.purple:hover{background:#181450;border-color:#818cf8;color:#ddd6fe}',
+      '.pr-btn.red{color:#f87171;border-color:#7f1d1d;background:#1e0e0e}',
+      '.pr-btn.red:hover{background:#2a1010;border-color:#dc2626;color:#fca5a5}',
+
+      // toggle row (for hacks)
+      '.pr-toggle-row{display:flex;align-items:center;justify-content:space-between;gap:16px}',
+      '.pr-toggle-info{flex:1;min-width:0}',
+      '.pr-toggle-name{font-size:17px;color:#d0d8f0;margin-bottom:5px}',
+      '.pr-toggle-status{font-size:15px;color:#9aaac0;line-height:1.4}',
+      '.pr-toggle-row.active .pr-toggle-name{color:#a5b4fc}',
+      '.pr-toggle-row.active .pr-toggle-status{color:#7c8fff}',
+
+      // toggle switch
+      '.pr-toggle{position:relative;width:44px;height:24px;flex-shrink:0}',
+      '.pr-toggle input{opacity:0;width:0;height:0}',
+      '.pr-slider{position:absolute;inset:0;background:#1a2235;border-radius:24px;cursor:pointer;border:1px solid #2a3650;transition:all .2s}',
+      '.pr-slider::before{content:"";position:absolute;height:16px;width:16px;left:3px;top:50%;transform:translateY(-50%);background:#3a4a68;border-radius:50%;transition:transform .2s,background .2s}',
+      '.pr-toggle input:checked + .pr-slider{background:#1a1f4a;border-color:#7c8fff}',
+      '.pr-toggle input:checked + .pr-slider::before{transform:translateX(20px) translateY(-50%);background:#a5b4fc}',
+
+      // status bar
+      '#pr-statusbar{flex-shrink:0;border-top:1px solid #1e2a40;padding:9px 16px;display:flex;align-items:center;gap:8px;background:#0b0f18}',
+      '.pr-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;background:#2e3a52;transition:background .3s}',
+      '.pr-dot.on{background:#22c55e;box-shadow:0 0 8px rgba(34,197,94,.5)}',
+      '.pr-dot.blink{background:#f59e0b;animation:pr-blink 1s infinite}',
+      '@keyframes pr-blink{0%,100%{opacity:1}50%{opacity:.25}}',
+      '#pr-status-text{font-size:15px;color:#9aaac0;flex:1}',
+
+      // footer
+      '#pr-footer{flex-shrink:0;padding:8px 16px 12px;font-size:15px;color:#8a9ab8;text-align:center;letter-spacing:.05em}',
+      '#pr-footer kbd{background:#1e2840;border:1px solid #3a4e6a;border-radius:4px;padding:2px 7px;font-family:inherit;color:#a0b0d0}',
+    ].join('\n');
+
+    style.textContent = css;
+    document.head.appendChild(style);
+
+    const homeHTML = SECTIONS.map(s =>
+      '<button class="pr-category-btn" data-section="' + s.id + '">' +
+        '<span class="pr-cat-icon">' + s.icon + '</span>' +
+        '<span class="pr-cat-info">' +
+          '<div class="pr-cat-label">' + s.label + '</div>' +
+          '<div class="pr-cat-desc">' + s.description + '</div>' +
+        '</span>' +
+        '<span class="pr-cat-arrow">›</span>' +
+      '</button>'
+    ).join('');
+
+    overlay.innerHTML =
+      '<div id="pr-panel">' +
+        '<div id="pr-bar">' +
+          '<div id="pr-bar-left">' +
+            '<button id="pr-back">‹</button>' +
+            '<div>' +
+              '<div id="pr-bar-title">PokeRogue</div>' +
+              '<div id="pr-bar-sub">CHEAT MENU</div>' +
+            '</div>' +
+          '</div>' +
+          '<button id="pr-close">✕</button>' +
+        '</div>' +
+        '<div id="pr-body">' +
+          '<div id="pr-home">' +
+            '<div class="pr-home-label">Categories</div>' +
+            homeHTML +
+          '</div>' +
+          '<div id="pr-section"></div>' +
+        '</div>' +
+        '<div id="pr-statusbar">' +
+          '<span class="pr-dot blink" id="pr-dot"></span>' +
+          '<span id="pr-status-text">Searching for game…</span>' +
+        '</div>' +
+        '<div id="pr-footer">Press <kbd>' + TOGGLE_KEY + '</kbd> to open / close</div>' +
+      '</div>';
+
+    document.body.appendChild(overlay);
+
+    // ── navigation ──
+    const homeEl    = overlay.querySelector('#pr-home');
+    const sectionEl = overlay.querySelector('#pr-section');
+    const backBtn   = overlay.querySelector('#pr-back');
+    const barSub    = overlay.querySelector('#pr-bar-sub');
+
+    function goHome() {
+      activeSection = null;
+      if (_sectionTick) { clearInterval(_sectionTick); _sectionTick = null; }
+      homeEl.style.display = '';
+      sectionEl.className = 'pr-section';
+      sectionEl.innerHTML = '';
+      backBtn.classList.remove('visible');
+      barSub.textContent = 'CHEAT MENU';
+    }
+
+    function goSection(id) {
+      const sec = SECTIONS.find(s => s.id === id);
+      if (!sec) return;
+      activeSection = id;
+      homeEl.style.display = 'none';
+      sectionEl.className = 'pr-section visible';
+      sectionEl.innerHTML = '';
+      backBtn.classList.add('visible');
+      barSub.textContent = sec.label.toUpperCase();
+      const tick = sec.buildContent(sectionEl);
+      if (typeof tick === 'function') {
+        tick();
+        _sectionTick = setInterval(tick, 800);
+      }
+    }
+
+    overlay.querySelectorAll('.pr-category-btn').forEach(btn => {
+      btn.addEventListener('click', () => goSection(btn.dataset.section));
+    });
+    backBtn.addEventListener('click', goHome);
+
+    // ── status bar ──
+    const dot        = overlay.querySelector('#pr-dot');
+    const statusText = overlay.querySelector('#pr-status-text');
+
+    _statusTimer = setInterval(() => {
+      const gd = findGameData();
+      if (gd) {
+        dot.className = 'pr-dot on';
+        const ec = getEggCount();
+        statusText.textContent = 'Connected  ·  Eggs: ' + (ec !== null ? ec : '?');
+      } else {
+        dot.className = 'pr-dot blink';
+        statusText.textContent = 'Searching… open the Gacha menu';
+      }
+    }, 1000);
+
+    // ── close / backdrop ──
+    overlay.querySelector('#pr-close').addEventListener('click', hideGUI);
+    overlay.addEventListener('click', e => { if (e.target === overlay) hideGUI(); });
+
+
+
+    overlay._cleanup = () => {
+      if (_sectionTick) clearInterval(_sectionTick);
+      if (_statusTimer) clearInterval(_statusTimer);
+      style.remove();
+    };
+  }
+
+  function showGUI() {
+    if (!document.getElementById('pr-cheat-gui')) { buildGUI(); guiVisible = true; }
+  }
+  function hideGUI() {
+    const el = document.getElementById('pr-cheat-gui');
+    if (el) { el._cleanup?.(); el.remove(); }
+    activeSection = null;
+    _sectionTick = null;
+    _statusTimer = null;
+    guiVisible = false;
+  }
+  function toggleGUI() { guiVisible ? hideGUI() : showGUI(); }
+
+  document.addEventListener('keydown', e => {
+    if (e.key === TOGGLE_KEY) { e.preventDefault(); toggleGUI(); }
+  });
+
+  // corner pill
+  const pill = document.createElement('div');
+  Object.assign(pill.style, {
+    position: 'fixed', bottom: '12px', right: '12px',
+    background: '#141b28', border: '1px solid #2a3650',
+    borderRadius: '6px', padding: '5px 10px',
+    fontFamily: "'Share Tech Mono', monospace", fontSize: '11px',
+    color: '#5a6a88', zIndex: '999997', cursor: 'pointer',
+    userSelect: 'none', letterSpacing: '0.1em',
+  });
+  pill.textContent = '[' + TOGGLE_KEY + '] CHEATS';
+  pill.addEventListener('click', toggleGUI);
+  document.body.appendChild(pill);
+
+})();
