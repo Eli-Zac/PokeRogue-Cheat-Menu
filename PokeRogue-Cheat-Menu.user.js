@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokeRogue Cheat Menu
 // @namespace    https://github.com/Eli-Zac/PokeRogue-Cheat-Menu
-// @version      1.6
+// @version      1.7
 // @description  Cheat menu for PokeRogue
 // @author       Eli_Zac
 // @match        *://pokerogue.net/*
@@ -205,6 +205,110 @@
     { value: 4, label: 'Manaphy' },
   ];
 
+  function getEggTargetTier(typeId) {
+    return typeId === 4 ? 2 : Math.max(0, Math.min(3, Number(typeId) || 0));
+  }
+
+  function getEggSourceType(typeId) {
+    return typeId === 3 ? 1 : 0;
+  }
+
+  function makeManaphyEggId() {
+    const now = Math.max(204, Date.now());
+    return Math.ceil(now / 204) * 204;
+  }
+
+  function snapshotEggState(gd) {
+    return {
+      eggPity: Array.isArray(gd?.eggPity) ? [...gd.eggPity] : null,
+      unlockPity: Array.isArray(gd?.unlockPity) ? [...gd.unlockPity] : null,
+      gameStats: gd?.gameStats ? {
+        eggsPulled: gd.gameStats.eggsPulled,
+        rareEggsPulled: gd.gameStats.rareEggsPulled,
+        epicEggsPulled: gd.gameStats.epicEggsPulled,
+        legendaryEggsPulled: gd.gameStats.legendaryEggsPulled,
+        manaphyEggsPulled: gd.gameStats.manaphyEggsPulled,
+      } : null,
+    };
+  }
+
+  function restoreEggState(gd, snapshot) {
+    if (!gd || !snapshot) return;
+    if (snapshot.eggPity && Array.isArray(gd.eggPity)) gd.eggPity.splice(0, gd.eggPity.length, ...snapshot.eggPity);
+    if (snapshot.unlockPity && Array.isArray(gd.unlockPity)) gd.unlockPity.splice(0, gd.unlockPity.length, ...snapshot.unlockPity);
+    if (snapshot.gameStats && gd.gameStats) Object.assign(gd.gameStats, snapshot.gameStats);
+  }
+
+  function removeEggsByIds(gd, ids) {
+    const eggs = gd?.eggs;
+    if (!Array.isArray(eggs) || !ids?.size) return;
+    for (let i = eggs.length - 1; i >= 0; i--) {
+      if (ids.has(eggs[i]?.id)) eggs.splice(i, 1);
+    }
+  }
+
+  function getEggConstructor(gd) {
+    const existingEgg = gd?.eggs?.find(egg => egg?.constructor && egg.constructor !== Object);
+    if (existingEgg?.constructor) return existingEgg.constructor;
+
+    const handler = findGachaHandler();
+    if (!handler || typeof handler.pullEggs !== 'function') return null;
+
+    const snapshot = snapshotEggState(gd);
+    const originalCursor = handler.gachaCursor;
+    const originalGuaranteed = handler.getGuaranteedEggTierFromPullCount;
+    let createdEggs = [];
+
+    try {
+      handler.gachaCursor = 0;
+      if (typeof originalGuaranteed === 'function') handler.getGuaranteedEggTierFromPullCount = () => 1;
+      createdEggs = handler.pullEggs(1) || [];
+    } catch (_) {
+      createdEggs = [];
+    } finally {
+      try { handler.gachaCursor = originalCursor; } catch (_) {}
+      if (typeof originalGuaranteed === 'function') {
+        try { handler.getGuaranteedEggTierFromPullCount = originalGuaranteed; } catch (_) {}
+      }
+    }
+
+    const EggCtor = createdEggs[0]?.constructor && createdEggs[0].constructor !== Object
+      ? createdEggs[0].constructor
+      : null;
+
+    const createdIds = new Set(createdEggs.map(egg => egg?.id).filter(id => id !== undefined));
+    removeEggsByIds(gd, createdIds);
+    restoreEggState(gd, snapshot);
+
+    return EggCtor;
+  }
+
+  function tryAddEggWithConstructor(gd, typeId) {
+    const EggCtor = getEggConstructor(gd);
+    if (!EggCtor) return false;
+
+    const options = {
+      pulled: true,
+      sourceType: getEggSourceType(typeId),
+      tier: getEggTargetTier(typeId),
+    };
+
+    if (typeId === 4) options.id = makeManaphyEggId();
+
+    const before = gd?.eggs?.length ?? 0;
+    try {
+      new EggCtor(options);
+    } catch (_) {
+      try {
+        new EggCtor({ scene: findGameScene(), ...options });
+      } catch (_) {
+        return false;
+      }
+    }
+
+    return (gd?.eggs?.length ?? 0) > before;
+  }
+
   function cloneEggTemplate(egg) {
     if (typeof structuredClone === 'function') return structuredClone(egg);
     return JSON.parse(JSON.stringify(egg));
@@ -219,11 +323,11 @@
 
     const clone = cloneEggTemplate(template);
     ['gachaType', 'eggType', 'sourceType', 'type', 'tier'].forEach(key => {
-      if (Object.prototype.hasOwnProperty.call(clone, key)) clone[key] = typeId;
+      if (Object.prototype.hasOwnProperty.call(clone, key)) clone[key] = typeId === 4 ? 2 : typeId;
     });
 
     if (Object.prototype.hasOwnProperty.call(clone, 'id')) {
-      clone.id = Date.now() + '-' + Math.random().toString(36).slice(2);
+      clone.id = typeId === 4 ? makeManaphyEggId() : Date.now() + '-' + Math.random().toString(36).slice(2);
     }
 
     eggs.push(clone);
@@ -269,6 +373,37 @@
     return false;
   }
 
+  async function deleteAllEggs(onProgress) {
+    const gd = findGameData();
+    if (!gd || !Array.isArray(gd.eggs)) return { ok: false, deleted: 0, reason: 'connect' };
+
+    const total = gd.eggs.length;
+    if (total === 0) {
+      await triggerAutosaveAfterEggChange();
+      return { ok: true, deleted: 0 };
+    }
+
+    if (typeof onProgress === 'function') onProgress(0, total, 0);
+
+    const batchSize = 50;
+    let deleted = 0;
+
+    while (gd.eggs.length > 0) {
+      const remove = Math.min(batchSize, gd.eggs.length);
+      gd.eggs.splice(gd.eggs.length - remove, remove);
+      deleted += remove;
+
+      if (typeof onProgress === 'function') {
+        onProgress(deleted, total, Math.round((deleted / total) * 100));
+      }
+
+      if (gd.eggs.length > 0) await waitTick();
+    }
+
+    await triggerAutosaveAfterEggChange();
+    return { ok: true, deleted };
+  }
+
   function waitTick() {
     return new Promise(resolve => setTimeout(resolve, 0));
   }
@@ -284,7 +419,7 @@
     if (typeof onProgress === 'function') onProgress(0, target, 0);
 
     for (let i = 0; i < target; i++) {
-      if (tryAddEggWithGameMethod(gd, typeId) || pushEggClone(gd, typeId)) {
+      if (tryAddEggWithConstructor(gd, typeId) || tryAddEggWithGameMethod(gd, typeId) || pushEggClone(gd, typeId)) {
         added++;
       } else {
         break;
@@ -362,6 +497,109 @@
     }
 
     return invoked;
+  }
+
+  // ─── POKEDEX HACKS ─────────────────────────────────────────────────────────
+
+  // Bitmask covering NON_SHINY(1) | SHINY(2) | MALE(4) | FEMALE(8) |
+  // DEFAULT_VARIANT(16) | VARIANT_2(32) | VARIANT_3(64) | DEFAULT_FORM(128)
+  // plus generous headroom for extended form bits.
+  const FULL_DEX_ATTR = (1n << 12n) - 1n; // 4095n
+  // All 25 natures unlocked (bits 0-24)
+  const FULL_NATURE_ATTR = (1 << 25) - 1;
+
+  function getDexStats() {
+    const gd = findGameData();
+    if (!gd?.dexData) return null;
+    const keys = Object.keys(gd.dexData);
+    let caught = 0;
+    for (const k of keys) {
+      if (gd.dexData[k]?.caughtAttr) caught++;
+    }
+    return { total: keys.length, caught };
+  }
+
+  async function catchAllPokemon(onProgress) {
+    const gd = findGameData();
+    if (!gd?.dexData) return { ok: false, updated: 0, reason: 'connect' };
+
+    const keys = Object.keys(gd.dexData);
+    const total = keys.length;
+    let updated = 0;
+
+    if (typeof onProgress === 'function') onProgress(0, total, 0);
+
+    for (let i = 0; i < keys.length; i++) {
+      const entry = gd.dexData[keys[i]];
+      if (!entry) continue;
+
+      // Mark as fully caught & seen
+      if (typeof entry.caughtAttr === 'bigint' || entry.caughtAttr === undefined) {
+        entry.caughtAttr = FULL_DEX_ATTR;
+      }
+      if (typeof entry.seenAttr === 'bigint' || entry.seenAttr === undefined) {
+        entry.seenAttr = FULL_DEX_ATTR;
+      }
+
+      // Bump counts
+      if (typeof entry.caughtCount === 'number') entry.caughtCount = Math.max(1, entry.caughtCount);
+      else entry.caughtCount = 1;
+      if (typeof entry.seenCount === 'number') entry.seenCount = Math.max(1, entry.seenCount);
+      else entry.seenCount = 1;
+
+      // Unlock all natures
+      if (typeof entry.natureAttr === 'number' || entry.natureAttr === undefined) {
+        entry.natureAttr = FULL_NATURE_ATTR;
+      }
+
+      updated++;
+
+      if (typeof onProgress === 'function' && i % 50 === 0) {
+        onProgress(updated, total, Math.round((updated / total) * 100));
+        await waitTick();
+      }
+    }
+
+    // Try to persist via game save methods
+    await triggerAutosaveAfterEggChange();
+
+    return { ok: true, updated };
+  }
+
+  async function resetCaughtPokemon(onProgress) {
+    const gd = findGameData();
+    if (!gd?.dexData) return { ok: false, updated: 0, reason: 'connect' };
+
+    const keys = Object.keys(gd.dexData);
+    const total = keys.length;
+    let updated = 0;
+
+    if (typeof onProgress === 'function') onProgress(0, total, 0);
+
+    for (let i = 0; i < keys.length; i++) {
+      const entry = gd.dexData[keys[i]];
+      if (!entry) continue;
+
+      if (typeof entry.caughtAttr === 'bigint' || entry.caughtAttr === undefined) {
+        entry.caughtAttr = 0n;
+      } else {
+        entry.caughtAttr = 0;
+      }
+
+      if (typeof entry.caughtCount === 'number') entry.caughtCount = 0;
+      else entry.caughtCount = 0;
+
+      updated++;
+
+      if (typeof onProgress === 'function' && i % 50 === 0) {
+        onProgress(updated, total, Math.round((updated / total) * 100));
+        await waitTick();
+      }
+    }
+
+    await triggerAutosaveAfterEggChange();
+
+    return { ok: true, updated };
   }
 
   // ─── TOAST ───────────────────────────────────────────────────────────────
@@ -447,14 +685,15 @@
           <div class="pr-card">
             <div class="pr-card-header">
               <div class="pr-card-title">Give Eggs by Type</div>
-              <div class="pr-card-desc">Choose from fixed egg types and add up to 500 at once</div>
+              <div class="pr-card-desc">Choose from fixed egg types, add up to 500 at once, or clear your current egg storage</div>
             </div>
             <div class="pr-egg-tools-grid">
               <select class="pr-input" id="pr-egg-type-select"></select>
               <input class="pr-input" id="pr-egg-amount" type="number" min="1" max="500" value="1" placeholder="amount">
             </div>
-            <div class="pr-egg-btn-row">
+            <div class="pr-egg-btn-row pr-egg-btn-row-double">
               <button class="pr-btn green" id="pr-egg-add">+ Add Eggs</button>
+              <button class="pr-btn red" id="pr-egg-delete-all">🗑 Delete All Eggs</button>
             </div>
           </div>
         `;
@@ -508,13 +747,15 @@
         const eggTypeSelect = container.querySelector('#pr-egg-type-select');
         const eggAmountInput = container.querySelector('#pr-egg-amount');
         const eggAddBtn = container.querySelector('#pr-egg-add');
+        const eggDeleteAllBtn = container.querySelector('#pr-egg-delete-all');
         let eggAddBusy = false;
+        let eggDeleteBusy = false;
         eggTypeSelect.innerHTML = EGG_TYPE_OPTIONS
           .map(o => '<option value="' + o.value + '">' + o.label + '</option>')
           .join('');
 
         async function applyEggAdd() {
-          if (eggAddBusy) return;
+          if (eggAddBusy || eggDeleteBusy) return;
           const typeId = Number(eggTypeSelect.value);
           const amount = Math.min(500, Math.max(1, parseInt(eggAmountInput.value, 10) || 1));
           eggAmountInput.value = String(amount);
@@ -527,6 +768,7 @@
           eggAddBusy = true;
           const originalText = eggAddBtn.textContent;
           eggAddBtn.disabled = true;
+          eggDeleteAllBtn.disabled = true;
           eggAddBtn.classList.add('pr-loading');
           eggTypeSelect.disabled = true;
           eggAmountInput.disabled = true;
@@ -542,11 +784,12 @@
               showToast('✅ Added ' + result.added + ' ' + typeLabel + ' egg(s)' + partial);
               await triggerAutosaveAfterEggChange();
             } else {
-              showToast('⚠️ Could not add eggs. Open Gacha first.', true);
+              showToast('⚠️ Could not add eggs.', true);
             }
           } finally {
             eggAddBtn.textContent = originalText;
             eggAddBtn.disabled = false;
+            eggDeleteAllBtn.disabled = false;
             eggAddBtn.classList.remove('pr-loading');
             eggTypeSelect.disabled = false;
             eggAmountInput.disabled = false;
@@ -554,7 +797,39 @@
           }
         }
 
+        async function applyDeleteAllEggs() {
+          if (eggAddBusy || eggDeleteBusy) return;
+
+          eggDeleteBusy = true;
+          const originalText = eggDeleteAllBtn.textContent;
+          eggDeleteAllBtn.disabled = true;
+          eggAddBtn.disabled = true;
+          eggDeleteAllBtn.classList.add('pr-loading');
+          eggTypeSelect.disabled = true;
+          eggAmountInput.disabled = true;
+
+          try {
+            const result = await deleteAllEggs((_done, _total, pct) => {
+              eggDeleteAllBtn.textContent = 'Deleting… ' + pct + '%';
+            });
+            if (result.ok) {
+              showToast('✅ Deleted ' + result.deleted + ' egg(s)');
+            } else {
+              showToast('⚠️ Could not delete eggs.', true);
+            }
+          } finally {
+            eggDeleteAllBtn.textContent = originalText;
+            eggDeleteAllBtn.disabled = false;
+            eggAddBtn.disabled = false;
+            eggDeleteAllBtn.classList.remove('pr-loading');
+            eggTypeSelect.disabled = false;
+            eggAmountInput.disabled = false;
+            eggDeleteBusy = false;
+          }
+        }
+
         eggAddBtn.addEventListener('click', applyEggAdd);
+        eggDeleteAllBtn.addEventListener('click', applyDeleteAllEggs);
         eggAmountInput.addEventListener('input', () => {
           const raw = eggAmountInput.value;
           if (raw === '') return;
@@ -582,6 +857,101 @@
               (_eggLimitRemoved ? '  •  limit off' : '  •  99 max');
           } else {
             eggCountEl.textContent = 'waiting for game connection';
+          }
+        };
+      }
+    },
+    // add more sections here
+    {
+      id: 'pokemon',
+      icon: '⚡',
+      label: 'Pokémon',
+      description: 'Pokédex completion & catch tools',
+      buildContent(container) {
+        container.innerHTML = `
+          <div class="pr-card">
+            <div class="pr-card-header">
+              <div class="pr-card-title">Pokédex</div>
+              <div class="pr-card-desc">Mark every Pokémon as caught, or reset all caught status with confirmation</div>
+            </div>
+            <div class="pr-dex-stats" id="pr-dex-stats">—</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+              <button class="pr-btn green" id="pr-catch-all">✓ Catch All Pokémon</button>
+              <button class="pr-btn red" id="pr-reset-caught">↺ Reset Caught Status</button>
+            </div>
+          </div>
+        `;
+
+        const statsEl  = container.querySelector('#pr-dex-stats');
+        const catchBtn = container.querySelector('#pr-catch-all');
+        const resetBtn = container.querySelector('#pr-reset-caught');
+        let busy = false;
+
+        function setBusyState(nextBusy) {
+          busy = nextBusy;
+          catchBtn.disabled = nextBusy;
+          resetBtn.disabled = nextBusy;
+        }
+
+        catchBtn.addEventListener('click', async () => {
+          if (busy) return;
+          const gd = findGameData();
+          if (!gd?.dexData) { showToast('⚠️ No game data found', true); return; }
+
+          setBusyState(true);
+          catchBtn.classList.add('pr-loading');
+          const origText = catchBtn.textContent;
+
+          try {
+            const result = await catchAllPokemon((_done, _total, pct) => {
+              catchBtn.textContent = 'Working… ' + pct + '%';
+            });
+            if (result.ok) {
+              showToast('✅ Caught ' + result.updated + ' Pokémon!');
+            } else {
+              showToast('⚠️ Open a game save first', true);
+            }
+          } finally {
+            catchBtn.textContent = origText;
+            catchBtn.classList.remove('pr-loading');
+            setBusyState(false);
+          }
+        });
+
+        resetBtn.addEventListener('click', async () => {
+          if (busy) return;
+          const gd = findGameData();
+          if (!gd?.dexData) { showToast('⚠️ No game data found', true); return; }
+
+          const confirmed = globalThis.confirm('⚠️ This will mark all Pokémon as uncaught in your Pokédex. Continue?');
+          if (!confirmed) return;
+
+          setBusyState(true);
+          resetBtn.classList.add('pr-loading');
+          const origText = resetBtn.textContent;
+
+          try {
+            const result = await resetCaughtPokemon((_done, _total, pct) => {
+              resetBtn.textContent = 'Resetting… ' + pct + '%';
+            });
+            if (result.ok) {
+              showToast('✅ Reset caught status for ' + result.updated + ' Pokémon');
+            } else {
+              showToast('⚠️ Open a game save first', true);
+            }
+          } finally {
+            resetBtn.textContent = origText;
+            resetBtn.classList.remove('pr-loading');
+            setBusyState(false);
+          }
+        });
+
+        return function tick() {
+          const stats = getDexStats();
+          if (stats) {
+            statsEl.textContent = stats.caught + ' / ' + stats.total + ' caught';
+          } else {
+            statsEl.textContent = 'waiting for game connection';
           }
         };
       }
@@ -649,6 +1019,7 @@
       '.pr-card-header{display:flex;flex-direction:column;gap:4px;padding-bottom:12px;border-bottom:1px solid #1e2d40}',
       '.pr-card-title{font-size:18px;color:#d0d8f0;letter-spacing:.03em}',
       '.pr-card-desc{font-size:15px;color:#8a9ab8;line-height:1.5}',
+      '.pr-dex-stats{font-size:22px;color:#7c8fff;font-weight:700;letter-spacing:.04em;padding:2px 0}',
 
       // voucher grid
       '.pr-voucher-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}',
@@ -667,6 +1038,7 @@
       '#pr-egg-type-select{min-width:0}',
       '#pr-egg-amount{text-align:center}',
       '.pr-egg-btn-row{display:grid;grid-template-columns:1fr;gap:8px}',
+      '.pr-egg-btn-row-double{grid-template-columns:1fr 1fr}',
 
       // buttons
       '.pr-btn-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}',
@@ -682,6 +1054,7 @@
       '.pr-btn.purple:hover{background:#181450;border-color:#818cf8;color:#ddd6fe}',
       '.pr-btn.red{color:#f87171;border-color:#7f1d1d;background:#1e0e0e}',
       '.pr-btn.red:hover{background:#2a1010;border-color:#dc2626;color:#fca5a5}',
+      '.pr-btn.red.pr-loading,.pr-btn.red.pr-loading:hover{color:#fecaca;border-color:#dc2626;background:#3b0d0d}',
 
       // toggle row (for hacks)
       '.pr-toggle-row{display:flex;align-items:center;justify-content:space-between;gap:16px}',
