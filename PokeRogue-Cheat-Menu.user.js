@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokeRogue Cheat Menu
 // @namespace    https://github.com/Eli-Zac/PokeRogue-Cheat-Menu
-// @version      1.5
+// @version      1.6
 // @description  Cheat menu for PokeRogue
 // @author       Eli_Zac
 // @match        *://pokerogue.net/*
@@ -22,6 +22,10 @@
   const TOGGLE_KEY = 'F2';
   let guiVisible = false;
   let activeSection = null;
+
+  function getScriptVersion() {
+    return globalThis.GM_info?.script?.version || 'unknown';
+  }
 
   // ─── PHASER ACCESS ───────────────────────────────────────────────────────
 
@@ -183,6 +187,183 @@
     return gd?.eggs?.length ?? null;
   }
 
+  function getEggTypeFromEntry(egg) {
+    if (!egg || typeof egg !== 'object') return null;
+    const keys = ['gachaType', 'eggType', 'sourceType', 'type', 'tier'];
+    for (const key of keys) {
+      const v = egg[key];
+      if (Number.isFinite(v)) return v;
+    }
+    return null;
+  }
+
+  const EGG_TYPE_OPTIONS = [
+    { value: 0, label: 'Common' },
+    { value: 1, label: 'Rare' },
+    { value: 2, label: 'Epic' },
+    { value: 3, label: 'Legendary' },
+    { value: 4, label: 'Manaphy' },
+  ];
+
+  function cloneEggTemplate(egg) {
+    if (typeof structuredClone === 'function') return structuredClone(egg);
+    return JSON.parse(JSON.stringify(egg));
+  }
+
+  function pushEggClone(gd, typeId) {
+    const eggs = gd?.eggs;
+    if (!Array.isArray(eggs) || eggs.length === 0) return false;
+
+    const template = eggs.find(e => getEggTypeFromEntry(e) === typeId) ?? eggs[0];
+    if (!template) return false;
+
+    const clone = cloneEggTemplate(template);
+    ['gachaType', 'eggType', 'sourceType', 'type', 'tier'].forEach(key => {
+      if (Object.prototype.hasOwnProperty.call(clone, key)) clone[key] = typeId;
+    });
+
+    if (Object.prototype.hasOwnProperty.call(clone, 'id')) {
+      clone.id = Date.now() + '-' + Math.random().toString(36).slice(2);
+    }
+
+    eggs.push(clone);
+    return true;
+  }
+
+  function tryAddEggWithGameMethod(gd, typeId) {
+    const methodNames = [
+      'addEgg',
+      'addEggs',
+      'createEgg',
+      'createEggs',
+      'generateEgg',
+      'generateEggs',
+      'giveEgg',
+      'giveEggs',
+    ];
+
+    for (const name of methodNames) {
+      const fn = gd?.[name];
+      if (typeof fn !== 'function') continue;
+
+      const argSets = [
+        [typeId],
+        [typeId, 1],
+        [1, typeId],
+        [{ type: typeId }],
+        [{ gachaType: typeId }],
+      ];
+
+      for (const args of argSets) {
+        const before = gd?.eggs?.length ?? 0;
+        try {
+          fn.apply(gd, args);
+        } catch (_) {
+          continue;
+        }
+        const after = gd?.eggs?.length ?? 0;
+        if (after > before) return true;
+      }
+    }
+
+    return false;
+  }
+
+  function waitTick() {
+    return new Promise(resolve => setTimeout(resolve, 0));
+  }
+
+  async function addEggsByType(typeId, amount, onProgress) {
+    const gd = findGameData();
+    if (!gd || !Array.isArray(gd.eggs)) return { ok: false, added: 0, reason: 'connect' };
+
+    const target = Math.max(1, Math.floor(Number(amount) || 0));
+    let added = 0;
+    const batchSize = 10;
+
+    if (typeof onProgress === 'function') onProgress(0, target, 0);
+
+    for (let i = 0; i < target; i++) {
+      if (tryAddEggWithGameMethod(gd, typeId) || pushEggClone(gd, typeId)) {
+        added++;
+      } else {
+        break;
+      }
+
+      if (typeof onProgress === 'function') {
+        const pct = Math.round((added / target) * 100);
+        onProgress(added, target, pct);
+      }
+
+      if ((i + 1) % batchSize === 0) {
+        await waitTick();
+      }
+    }
+
+    return { ok: added === target, added };
+  }
+
+  async function triggerAutosaveAfterEggChange() {
+    const scene = findGameScene();
+    const gd = findGameData();
+
+    const roots = [
+      gd,
+      scene,
+      scene?.gameData,
+      scene?.session,
+      scene?.ui,
+      uw.globalScene,
+    ].filter(Boolean);
+
+    const methodNames = [
+      'saveSystem',
+      'saveData',
+      'saveGameData',
+      'queueSave',
+      'queueSaveData',
+      'queueSystemSave',
+      'requestSave',
+      'updateSystem',
+      'updateSystemData',
+      'syncSystemData',
+    ];
+
+    const seen = new Set();
+    let invoked = false;
+
+    for (const root of roots) {
+      for (const name of methodNames) {
+        const fn = root?.[name];
+        if (typeof fn !== 'function') continue;
+        if (seen.has(fn)) continue;
+        seen.add(fn);
+
+        const argSets = [
+          [],
+          [true],
+          [{ source: 'cheat-menu', reason: 'manual-eggs' }],
+        ];
+
+        for (const args of argSets) {
+          try {
+            const result = fn.apply(root, args);
+            invoked = true;
+            if (result && typeof result.then === 'function') {
+              await Promise.race([
+                result,
+                new Promise(resolve => setTimeout(resolve, 350)),
+              ]);
+            }
+            break;
+          } catch (_) {}
+        }
+      }
+    }
+
+    return invoked;
+  }
+
   // ─── TOAST ───────────────────────────────────────────────────────────────
 
   function showToast(message, isError = false) {
@@ -225,22 +406,22 @@
               <div class="pr-voucher-card">
                 <span class="pr-voucher-tier">Regular</span>
                 <span class="pr-voucher-val" id="pv-cur-0">—</span>
-                <input class="pr-input" id="pv-in-0" type="number" min="0" max="9999" placeholder="new value">
+                <input class="pr-input pr-voucher-input" id="pv-in-0" type="number" min="0" max="9999" placeholder="new value">
               </div>
               <div class="pr-voucher-card">
                 <span class="pr-voucher-tier">Plus</span>
                 <span class="pr-voucher-val" id="pv-cur-1">—</span>
-                <input class="pr-input" id="pv-in-1" type="number" min="0" max="9999" placeholder="new value">
+                <input class="pr-input pr-voucher-input" id="pv-in-1" type="number" min="0" max="9999" placeholder="new value">
               </div>
               <div class="pr-voucher-card">
                 <span class="pr-voucher-tier">Premium</span>
                 <span class="pr-voucher-val" id="pv-cur-2">—</span>
-                <input class="pr-input" id="pv-in-2" type="number" min="0" max="9999" placeholder="new value">
+                <input class="pr-input pr-voucher-input" id="pv-in-2" type="number" min="0" max="9999" placeholder="new value">
               </div>
               <div class="pr-voucher-card">
                 <span class="pr-voucher-tier gold">✦ Golden</span>
                 <span class="pr-voucher-val gold" id="pv-cur-3">—</span>
-                <input class="pr-input" id="pv-in-3" type="number" min="0" max="9999" placeholder="new value">
+                <input class="pr-input pr-voucher-input" id="pv-in-3" type="number" min="0" max="9999" placeholder="new value">
               </div>
             </div>
             <div class="pr-btn-row">
@@ -260,6 +441,20 @@
                 <input type="checkbox" id="pr-egg-limit-toggle">
                 <span class="pr-slider"></span>
               </label>
+            </div>
+          </div>
+
+          <div class="pr-card">
+            <div class="pr-card-header">
+              <div class="pr-card-title">Give Eggs by Type</div>
+              <div class="pr-card-desc">Choose from fixed egg types and add up to 500 at once</div>
+            </div>
+            <div class="pr-egg-tools-grid">
+              <select class="pr-input" id="pr-egg-type-select"></select>
+              <input class="pr-input" id="pr-egg-amount" type="number" min="1" max="500" value="1" placeholder="amount">
+            </div>
+            <div class="pr-egg-btn-row">
+              <button class="pr-btn green" id="pr-egg-add">+ Add Eggs</button>
             </div>
           </div>
         `;
@@ -287,7 +482,7 @@
           else showToast('⚠️ Open the Gacha menu first', true);
         });
 
-        container.querySelectorAll('.pr-input').forEach(inp => {
+        container.querySelectorAll('.pr-voucher-input').forEach(inp => {
           inp.addEventListener('keydown', e => {
             if (e.key === 'Enter') applyVouchers();
             e.stopPropagation();
@@ -310,6 +505,71 @@
           }
         });
 
+        const eggTypeSelect = container.querySelector('#pr-egg-type-select');
+        const eggAmountInput = container.querySelector('#pr-egg-amount');
+        const eggAddBtn = container.querySelector('#pr-egg-add');
+        let eggAddBusy = false;
+        eggTypeSelect.innerHTML = EGG_TYPE_OPTIONS
+          .map(o => '<option value="' + o.value + '">' + o.label + '</option>')
+          .join('');
+
+        async function applyEggAdd() {
+          if (eggAddBusy) return;
+          const typeId = Number(eggTypeSelect.value);
+          const amount = Math.min(500, Math.max(1, parseInt(eggAmountInput.value, 10) || 1));
+          eggAmountInput.value = String(amount);
+
+          if (!Number.isFinite(typeId)) {
+            showToast('⚠️ Select a valid egg type', true);
+            return;
+          }
+
+          eggAddBusy = true;
+          const originalText = eggAddBtn.textContent;
+          eggAddBtn.disabled = true;
+          eggAddBtn.classList.add('pr-loading');
+          eggTypeSelect.disabled = true;
+          eggAmountInput.disabled = true;
+
+          try {
+            const result = await addEggsByType(typeId, amount, (_done, _total, pct) => {
+              eggAddBtn.textContent = 'Adding… ' + pct + '%';
+            });
+
+            if (result.added > 0) {
+              const partial = result.ok ? '' : ' (partial)';
+              const typeLabel = EGG_TYPE_OPTIONS.find(o => o.value === typeId)?.label ?? ('Type ' + typeId);
+              showToast('✅ Added ' + result.added + ' ' + typeLabel + ' egg(s)' + partial);
+              await triggerAutosaveAfterEggChange();
+            } else {
+              showToast('⚠️ Could not add eggs. Open Gacha first.', true);
+            }
+          } finally {
+            eggAddBtn.textContent = originalText;
+            eggAddBtn.disabled = false;
+            eggAddBtn.classList.remove('pr-loading');
+            eggTypeSelect.disabled = false;
+            eggAmountInput.disabled = false;
+            eggAddBusy = false;
+          }
+        }
+
+        eggAddBtn.addEventListener('click', applyEggAdd);
+        eggAmountInput.addEventListener('input', () => {
+          const raw = eggAmountInput.value;
+          if (raw === '') return;
+          const n = parseInt(raw, 10);
+          if (!Number.isFinite(n)) {
+            eggAmountInput.value = '1';
+            return;
+          }
+          eggAmountInput.value = String(Math.min(500, Math.max(1, n)));
+        });
+        eggAmountInput.addEventListener('keydown', e => {
+          if (e.key === 'Enter') applyEggAdd();
+          e.stopPropagation();
+        });
+
         const curEls = [0, 1, 2, 3].map(i => container.querySelector('#pv-cur-' + i));
         const eggCountEl = container.querySelector('#pr-egg-count-display');
 
@@ -321,7 +581,7 @@
             eggCountEl.textContent = ec + ' egg' + (ec !== 1 ? 's' : '') + ' stored' +
               (_eggLimitRemoved ? '  •  limit off' : '  •  99 max');
           } else {
-            eggCountEl.textContent = 'open Gacha menu to connect';
+            eggCountEl.textContent = 'waiting for game connection';
           }
         };
       }
@@ -335,6 +595,7 @@
   let _statusTimer = null;
 
   function buildGUI() {
+    if (document.getElementById('pr-cheat-gui')) return;
     const overlay = document.createElement('div');
     overlay.id = 'pr-cheat-gui';
 
@@ -402,14 +663,21 @@
       '.pr-input::placeholder{color:#4e6080}',
       '.pr-input::-webkit-outer-spin-button,.pr-input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}',
       '.pr-input[type=number]{-moz-appearance:textfield}',
+      '.pr-egg-tools-grid{display:grid;grid-template-columns:minmax(0,1fr) 110px;gap:8px}',
+      '#pr-egg-type-select{min-width:0}',
+      '#pr-egg-amount{text-align:center}',
+      '.pr-egg-btn-row{display:grid;grid-template-columns:1fr;gap:8px}',
 
       // buttons
       '.pr-btn-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}',
       '.pr-btn{background:#1a2235;border:1px solid #2a3650;border-radius:8px;padding:11px 10px;cursor:pointer;font-family:"Share Tech Mono",monospace;font-size:16px;color:#7a8aaa;transition:all .15s;text-align:center;white-space:nowrap}',
       '.pr-btn:hover{background:#1e2840;color:#e0e8ff;border-color:#4a5a80}',
       '.pr-btn:active{transform:scale(.97)}',
+      '.pr-btn:disabled{cursor:not-allowed;opacity:.75;pointer-events:none;transform:none}',
       '.pr-btn.green{color:#4ade80;border-color:#1a4030;background:#0e1e14}',
       '.pr-btn.green:hover{background:#142a1e;border-color:#22c55e;color:#86efac}',
+      '.pr-btn.green.pr-loading{color:#fde68a;border-color:#b45309;background:#2a1708}',
+      '.pr-btn.green.pr-loading:hover{color:#fde68a;border-color:#b45309;background:#2a1708}',
       '.pr-btn.purple{color:#c4b5fd;border-color:#3730a3;background:#12102e}',
       '.pr-btn.purple:hover{background:#181450;border-color:#818cf8;color:#ddd6fe}',
       '.pr-btn.red{color:#f87171;border-color:#7f1d1d;background:#1e0e0e}',
@@ -481,41 +749,75 @@
           '<span class="pr-dot blink" id="pr-dot"></span>' +
           '<span id="pr-status-text">Searching for game…</span>' +
         '</div>' +
-        '<div id="pr-footer">Press <kbd>' + TOGGLE_KEY + '</kbd> to open / close</div>' +
+        '<div id="pr-footer">v' + getScriptVersion() + ' · Press <kbd>' + TOGGLE_KEY + '</kbd> to open / close</div>' +
       '</div>';
 
     document.body.appendChild(overlay);
 
     // ── navigation ──
+    const panel     = overlay.querySelector('#pr-panel');
     const homeEl    = overlay.querySelector('#pr-home');
     const sectionEl = overlay.querySelector('#pr-section');
     const backBtn   = overlay.querySelector('#pr-back');
     const barSub    = overlay.querySelector('#pr-bar-sub');
 
-    function goHome() {
-      activeSection = null;
-      if (_sectionTick) { clearInterval(_sectionTick); _sectionTick = null; }
-      homeEl.style.display = '';
-      sectionEl.className = 'pr-section';
-      sectionEl.innerHTML = '';
-      backBtn.classList.remove('visible');
-      barSub.textContent = 'CHEAT MENU';
+    function animatePanelHeight(changeFn) {
+      // 1. pin current height (no transition yet)
+      const fromH = panel.offsetHeight;
+      panel.style.transition = 'none';
+      panel.style.height = fromH + 'px';
+
+      // 2. apply the content change
+      changeFn();
+
+      // 3. measure the natural target height without painting (still in same JS task)
+      panel.style.height = '';
+      const toH = panel.offsetHeight; // forces sync reflow → captures new natural height
+      panel.style.height = fromH + 'px'; // snap back to start
+      void panel.offsetHeight; // commit the snap
+
+      // 4. animate to target
+      panel.style.transition = 'height .28s cubic-bezier(0.4,0,0.2,1)';
+      panel.style.height = toH + 'px';
+
+      // 5. clean up once done so CSS max-height takes over again
+      panel.addEventListener('transitionend', e => {
+        if (e.propertyName === 'height') {
+          panel.style.height = '';
+          panel.style.transition = '';
+        }
+      }, { once: true });
     }
+
+    function goHome() {
+      animatePanelHeight(() => {
+        activeSection = null;
+        if (_sectionTick) { clearInterval(_sectionTick); _sectionTick = null; }
+        homeEl.style.display = '';
+        sectionEl.className = 'pr-section';
+        sectionEl.innerHTML = '';
+        backBtn.classList.remove('visible');
+        barSub.textContent = 'CHEAT MENU';
+      });
+    }
+    overlay._goHome = goHome;
 
     function goSection(id) {
       const sec = SECTIONS.find(s => s.id === id);
       if (!sec) return;
-      activeSection = id;
-      homeEl.style.display = 'none';
-      sectionEl.className = 'pr-section visible';
-      sectionEl.innerHTML = '';
-      backBtn.classList.add('visible');
-      barSub.textContent = sec.label.toUpperCase();
-      const tick = sec.buildContent(sectionEl);
-      if (typeof tick === 'function') {
-        tick();
-        _sectionTick = setInterval(tick, 800);
-      }
+      animatePanelHeight(() => {
+        activeSection = id;
+        homeEl.style.display = 'none';
+        sectionEl.className = 'pr-section visible';
+        sectionEl.innerHTML = '';
+        backBtn.classList.add('visible');
+        barSub.textContent = sec.label.toUpperCase();
+        const tick = sec.buildContent(sectionEl);
+        if (typeof tick === 'function') {
+          tick();
+          _sectionTick = setInterval(tick, 800);
+        }
+      });
     }
 
     overlay.querySelectorAll('.pr-category-btn').forEach(btn => {
@@ -527,40 +829,55 @@
     const dot        = overlay.querySelector('#pr-dot');
     const statusText = overlay.querySelector('#pr-status-text');
 
-    _statusTimer = setInterval(() => {
-      const gd = findGameData();
-      if (gd) {
-        dot.className = 'pr-dot on';
-        const ec = getEggCount();
-        statusText.textContent = 'Connected  ·  Eggs: ' + (ec !== null ? ec : '?');
-      } else {
-        dot.className = 'pr-dot blink';
-        statusText.textContent = 'Searching… open the Gacha menu';
-      }
-    }, 1000);
+    function startStatusTimer() {
+      if (_statusTimer) clearInterval(_statusTimer);
+      _statusTimer = setInterval(() => {
+        const gd = findGameData();
+        if (gd) {
+          dot.className = 'pr-dot on';
+          statusText.textContent = 'Connected to game';
+        } else {
+          dot.className = 'pr-dot blink';
+          statusText.textContent = 'Waiting for game connection…';
+        }
+      }, 1000);
+    }
+    overlay._startStatusTimer = startStatusTimer;
+    startStatusTimer();
 
     // ── close / backdrop ──
     overlay.querySelector('#pr-close').addEventListener('click', hideGUI);
     overlay.addEventListener('click', e => { if (e.target === overlay) hideGUI(); });
 
-
-
     overlay._cleanup = () => {
-      if (_sectionTick) clearInterval(_sectionTick);
-      if (_statusTimer) clearInterval(_statusTimer);
-      style.remove();
+      if (_sectionTick) { clearInterval(_sectionTick); _sectionTick = null; }
+      if (_statusTimer) { clearInterval(_statusTimer); _statusTimer = null; }
     };
   }
 
   function showGUI() {
-    if (!document.getElementById('pr-cheat-gui')) { buildGUI(); guiVisible = true; }
+    const existing = document.getElementById('pr-cheat-gui');
+    if (existing) {
+      existing.style.display = '';
+      // restart the open animation
+      existing.style.animation = 'none';
+      void existing.offsetHeight; // force reflow
+      existing.style.animation = '';
+      existing._startStatusTimer?.();
+      guiVisible = true;
+    } else {
+      buildGUI();
+      guiVisible = true;
+    }
   }
   function hideGUI() {
     const el = document.getElementById('pr-cheat-gui');
-    if (el) { el._cleanup?.(); el.remove(); }
+    if (el) {
+      el._cleanup?.();
+      el._goHome?.();
+      el.style.display = 'none';
+    }
     activeSection = null;
-    _sectionTick = null;
-    _statusTimer = null;
     guiVisible = false;
   }
   function toggleGUI() { guiVisible ? hideGUI() : showGUI(); }
