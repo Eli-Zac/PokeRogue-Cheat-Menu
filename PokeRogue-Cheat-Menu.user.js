@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokeRogue Cheat Menu
 // @namespace    https://github.com/Eli-Zac/PokeRogue-Cheat-Menu
-// @version      1.8
+// @version      1.9
 // @description  Cheat menu for PokeRogue
 // @author       Eli_Zac
 // @match        *://pokerogue.net/*
@@ -600,6 +600,47 @@
     await triggerAutosaveAfterEggChange();
 
     return { ok: true, updated };
+  }
+
+  // ─── GAME STATS ──────────────────────────────────────────────────────────
+
+  const STAT_LABELS = {
+    playTime:                  'Play Time (seconds)',
+    battles:                   'Battles',
+    classicSessionsPlayed:     'Classic Sessions Played',
+    endlessSessionsPlayed:     'Endless Sessions Played',
+    dailyRunSessionsPlayed:    'Daily Run Sessions Played',
+    pokemonSeen:               'Pokémon Seen',
+    pokemonCaught:             'Pokémon Caught',
+    pokemonHatched:            'Pokémon Hatched',
+    pokemonFused:              'Pokémon Fused',
+    pokemonDefeated:           'Pokémon Defeated',
+    shinyCaught:               'Shinies Caught',
+    shinyHatched:              'Shinies Hatched',
+    trainersDefeated:          'Trainers Defeated',
+    ribbonsEarned:             'Ribbons Earned',
+    eggsPulled:                'Eggs Pulled',
+    rareEggsPulled:            'Rare Eggs Pulled',
+    epicEggsPulled:            'Epic Eggs Pulled',
+    legendaryEggsPulled:       'Legendary Eggs Pulled',
+    manaphyEggsPulled:         'Manaphy Eggs Pulled',
+    subLegendaryEggsPulled:    'Sub-Legendary Eggs Pulled',
+    gamesBeat:                 'Games Beat',
+  };
+
+  function formatStatKey(key) {
+    if (STAT_LABELS[key]) return STAT_LABELS[key];
+    return key.replace(/([A-Z])/g, ' $1').replace(/^./, s => s.toUpperCase());
+  }
+
+  function getGameStats() {
+    const gd = findGameData();
+    if (!gd?.gameStats) return null;
+    const stats = {};
+    for (const [k, v] of Object.entries(gd.gameStats)) {
+      if (typeof v === 'number') stats[k] = v;
+    }
+    return Object.keys(stats).length ? stats : null;
   }
 
   // ─── SAVE DATA ───────────────────────────────────────────────────────────
@@ -1299,6 +1340,54 @@
         };
       }
     },
+    {
+      id: 'gamestats',
+      icon: '📊',
+      label: 'Game Stats',
+      description: 'Live read-out of battle, catch, egg & session counters',
+      buildContent(container) {
+        container.innerHTML = `
+          <div class="pr-card">
+            <div class="pr-card-header">
+              <div class="pr-card-title">Game Statistics</div>
+              <div class="pr-card-desc">Live read-out — updates every second</div>
+            </div>
+            <div class="pr-stats-grid" id="pr-stats-grid">
+              <div class="pr-stats-waiting">waiting for game connection…</div>
+            </div>
+          </div>
+        `;
+
+        const gridEl = container.querySelector('#pr-stats-grid');
+        let rendered = false;
+
+        function renderStats(stats) {
+          if (!stats) {
+            gridEl.innerHTML = '<div class="pr-stats-waiting">waiting for game connection…</div>';
+            rendered = false;
+            return;
+          }
+          if (!rendered) {
+            rendered = true;
+            gridEl.innerHTML = Object.keys(stats).map(k =>
+              '<div class="pr-stat-card">' +
+                '<div class="pr-stat-label">' + formatStatKey(k) + '</div>' +
+                '<div class="pr-stat-value" data-key="' + k + '">' + stats[k].toLocaleString() + '</div>' +
+              '</div>'
+            ).join('');
+          } else {
+            gridEl.querySelectorAll('.pr-stat-value').forEach(el => {
+              const live = stats[el.dataset.key];
+              if (live !== undefined) el.textContent = live.toLocaleString();
+            });
+          }
+        }
+
+        return function tick() {
+          renderStats(getGameStats());
+        };
+      }
+    },
     // add more sections here
   ];
 
@@ -1318,8 +1407,10 @@
       "@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@700&display=swap');",
 
       // overlay
-      '#pr-cheat-gui{position:fixed;inset:0;z-index:999998;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.72);backdrop-filter:blur(12px);animation:pr-in .15s ease}',
-      '@keyframes pr-in{from{opacity:0;transform:scale(.95)}to{opacity:1;transform:scale(1)}}',
+      '#pr-cheat-gui{position:fixed;inset:0;z-index:999998;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.72);backdrop-filter:blur(12px);animation:pr-in .18s ease}',
+      '@keyframes pr-in{from{opacity:0}to{opacity:1}}',
+      '@keyframes pr-out{from{opacity:1}to{opacity:0}}',
+      '#pr-cheat-gui.pr-closing{animation:pr-out .18s ease forwards}',
 
       // panel
       '#pr-panel{background:#0f1219;border:1px solid #2e3a52;border-radius:16px;width:560px;max-height:88vh;display:flex;flex-direction:column;box-shadow:0 0 0 1px #1a2235,0 32px 80px rgba(0,0,0,.95);overflow:hidden;font-family:"Share Tech Mono",monospace}',
@@ -1437,6 +1528,13 @@
       // save data stats & file info
       '.pr-save-stats{font-size:14px;color:#7c8fff;letter-spacing:.04em;padding:2px 0;min-height:18px}',
       '.pr-save-fileinfo{font-size:13px;color:#6a7a9a;letter-spacing:.04em;padding:1px 0}',
+
+      // game stats grid
+      '.pr-stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}',
+      '.pr-stat-card{background:#0f1219;border:1px solid #2a3650;border-radius:8px;padding:8px 10px;display:flex;flex-direction:column;gap:4px}',
+      '.pr-stat-label{font-size:10px;color:#6a7a9a;letter-spacing:.1em;text-transform:uppercase;line-height:1.3}',
+      '.pr-stat-value{font-size:17px;color:#a5b4fc;font-weight:700;letter-spacing:.02em;line-height:1.2}',
+      '.pr-stats-waiting{font-size:14px;color:#5a6a88;grid-column:1/-1;text-align:center;padding:12px 0}',
     ].join('\n');
 
     style.textContent = css;
@@ -1585,6 +1683,7 @@
   function showGUI() {
     const existing = document.getElementById('pr-cheat-gui');
     if (existing) {
+      existing.classList.remove('pr-closing');
       existing.style.display = '';
       // restart the open animation
       existing.style.animation = 'none';
@@ -1602,7 +1701,11 @@
     if (el) {
       el._cleanup?.();
       el._goHome?.();
-      el.style.display = 'none';
+      el.classList.add('pr-closing');
+      el.addEventListener('animationend', () => {
+        el.classList.remove('pr-closing');
+        el.style.display = 'none';
+      }, { once: true });
     }
     activeSection = null;
     guiVisible = false;
@@ -1610,8 +1713,13 @@
   function toggleGUI() { guiVisible ? hideGUI() : showGUI(); }
 
   document.addEventListener('keydown', e => {
-    if (e.key === TOGGLE_KEY) { e.preventDefault(); toggleGUI(); }
-  });
+    if (e.key === TOGGLE_KEY) { e.preventDefault(); toggleGUI(); return; }
+    if (guiVisible) {
+      if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); hideGUI(); return; }
+      // Block all other keypresses from reaching the game while the menu is open
+      e.stopImmediatePropagation();
+    }
+  }, true);
 
   // corner pill
   const pill = document.createElement('div');
