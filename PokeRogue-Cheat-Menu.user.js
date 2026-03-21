@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokeRogue Cheat Menu
 // @namespace    https://github.com/Eli-Zac/PokeRogue-Cheat-Menu
-// @version      1.7
+// @version      1.8
 // @description  Cheat menu for PokeRogue
 // @author       Eli_Zac
 // @match        *://pokerogue.net/*
@@ -602,6 +602,119 @@
     return { ok: true, updated };
   }
 
+  // ─── SAVE DATA ───────────────────────────────────────────────────────────
+
+  // Keys that represent persistent game progress on gameData
+  const SAVE_DATA_KEYS = [
+    'trainerId', 'secretId', 'gender', 'playTime', 'gameVersion', 'timestamp',
+    'dexData', 'starterData', 'eggs', 'eggPity', 'unlockPity',
+    'voucherCounts', 'vouchersUnlocked', 'achvUnlocks', 'unlocks',
+    'gameStats', 'sessionData',
+  ];
+
+  async function exportSaveData(onProgress) {
+    const gd = findGameData();
+    if (!gd) return { ok: false, reason: 'connect' };
+
+    if (typeof onProgress === 'function') onProgress('Collecting data\u2026', 10);
+    await new Promise(r => setTimeout(r, 400));
+
+    const seen = new WeakSet();
+    let json;
+    try {
+      if (typeof onProgress === 'function') onProgress('Serializing\u2026', 35);
+      await new Promise(r => setTimeout(r, 350));
+      json = JSON.stringify(gd, function (key, value) {
+        if (typeof value === 'function') return undefined;
+        if (typeof value === 'bigint') return { __type: 'BigInt', __value: value.toString() };
+        if (typeof value === 'object' && value !== null) {
+          if (seen.has(value)) return undefined;
+          seen.add(value);
+        }
+        return value;
+      }, 2);
+    } catch (e) {
+      return { ok: false, reason: 'serialize', error: e.message };
+    }
+
+    try {
+      if (typeof onProgress === 'function') onProgress('Packaging file\u2026', 70);
+      await new Promise(r => setTimeout(r, 350));
+      const kb = Math.round(json.length / 1024);
+      const blob = new Blob([json], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const ts = new Date().toISOString().replace(/[T:]/g, '-').replace(/\..+/, '');
+      a.download = 'pokerogue-save-' + ts + '.json';
+      document.body.appendChild(a);
+      if (typeof onProgress === 'function') onProgress('Downloading\u2026', 90);
+      await new Promise(r => setTimeout(r, 300));
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      if (typeof onProgress === 'function') onProgress('Done!', 100);
+      return { ok: true, kb };
+    } catch (e) {
+      return { ok: false, reason: 'download', error: e.message };
+    }
+  }
+
+  async function importSaveData(jsonText, onProgress) {
+    const gd = findGameData();
+    if (!gd) return { ok: false, reason: 'connect' };
+
+    let data;
+    try {
+      data = JSON.parse(jsonText, function (key, value) {
+        if (value && typeof value === 'object' && value.__type === 'BigInt' && value.__value !== undefined) {
+          return BigInt(value.__value);
+        }
+        return value;
+      });
+    } catch (e) {
+      return { ok: false, reason: 'syntax', error: e.message };
+    }
+
+    if (typeof data !== 'object' || data === null) {
+      return { ok: false, reason: 'parse', error: 'Invalid save file structure' };
+    }
+
+    // Sanity-check: require at least one known PokeRogue key
+    const VALIDATION_KEYS = ['dexData', 'trainerId', 'starterData', 'gameStats', 'voucherCounts'];
+    if (!VALIDATION_KEYS.some(k => k in data)) {
+      return { ok: false, reason: 'invalid', error: 'File does not appear to be a PokeRogue save (missing expected fields)' };
+    }
+
+    let restored = 0;
+
+    // Priority: restore known persistent keys first, then any remaining data keys
+    const importKeys = [...new Set([
+      ...SAVE_DATA_KEYS.filter(k => k in data),
+      ...Object.keys(data),
+    ])];
+    const total = importKeys.length;
+
+    for (let i = 0; i < importKeys.length; i++) {
+      try {
+        const val = data[importKeys[i]];
+        if (typeof val !== 'function') {
+          gd[importKeys[i]] = val;
+          restored++;
+        }
+      } catch (_) {}
+
+      if (typeof onProgress === 'function' && i % 5 === 0) {
+        onProgress(restored, total, Math.round(((i + 1) / total) * 100));
+        await waitTick();
+      }
+    }
+
+    if (typeof onProgress === 'function') onProgress(restored, total, 100);
+    await triggerAutosaveAfterEggChange();
+    return { ok: true, restored };
+  }
+
   // ─── TOAST ───────────────────────────────────────────────────────────────
 
   function showToast(message, isError = false) {
@@ -956,6 +1069,236 @@
         };
       }
     },
+    {
+      id: 'savedata',
+      icon: '💾',
+      label: 'Save Data',
+      description: 'Export & import your full game progress',
+      buildContent(container) {
+        container.innerHTML = `
+          <div class="pr-card pr-save-warn-card">
+            <div style="display:flex;align-items:center;gap:10px">
+              <span style="font-size:22px;flex-shrink:0;line-height:1">⚠️</span>
+              <div style="font-size:15px;color:#f0b429;line-height:1.55">
+                Always <strong>export a backup</strong> before importing. Importing overwrites your current in-memory save data immediately.
+              </div>
+            </div>
+          </div>
+
+          <div class="pr-card">
+            <div class="pr-card-header">
+              <div class="pr-card-title">Export Save Data</div>
+              <div class="pr-card-desc">Downloads your complete game progress as a JSON file — Pokédex, starter data, eggs, vouchers, achievements, game stats, and all other persistent fields.</div>
+            </div>
+            <div class="pr-save-stats" id="pr-save-stats">waiting for game connection…</div>
+            <div class="pr-save-progress-wrap" id="pr-export-progress-wrap" style="display:none">
+              <div class="pr-save-progress-bar" id="pr-export-bar"></div>
+            </div>
+            <button class="pr-btn green" id="pr-export-save" style="width:100%">⬇ Export to File</button>
+          </div>
+
+          <div class="pr-card">
+            <div class="pr-card-header">
+              <div class="pr-card-title">Import Save Data</div>
+              <div class="pr-card-desc">Load a previously exported JSON file to restore all persistent game progress, then auto-save to the server.</div>
+            </div>
+            <input type="file" id="pr-import-file" accept=".json" style="display:none">
+            <div style="display:grid;grid-template-columns:1fr auto;gap:8px;align-items:stretch">
+              <div class="pr-input pr-import-filename" id="pr-import-filename" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#4e6080;display:flex;align-items:center;border-radius:8px">No file selected…</div>
+              <button class="pr-btn" id="pr-import-choose">Browse</button>
+            </div>
+            <div class="pr-save-fileinfo" id="pr-import-fileinfo" style="display:none"></div>
+            <div class="pr-save-progress-wrap" id="pr-import-progress-wrap" style="display:none">
+              <div class="pr-save-progress-bar" id="pr-import-bar"></div>
+            </div>
+            <button class="pr-btn green" id="pr-import-save" disabled style="width:100%">⬆ Import from File</button>
+          </div>
+        `;
+
+        const exportBtn        = container.querySelector('#pr-export-save');
+        const exportProgressWrap = container.querySelector('#pr-export-progress-wrap');
+        const exportBar        = container.querySelector('#pr-export-bar');
+        const statsEl          = container.querySelector('#pr-save-stats');
+        const fileInput        = container.querySelector('#pr-import-file');
+        const filenameEl       = container.querySelector('#pr-import-filename');
+        const fileinfoEl       = container.querySelector('#pr-import-fileinfo');
+        const chooseBtn        = container.querySelector('#pr-import-choose');
+        const importBtn        = container.querySelector('#pr-import-save');
+        const importProgressWrap = container.querySelector('#pr-import-progress-wrap');
+        const importBar        = container.querySelector('#pr-import-bar');
+        let selectedFile       = null;
+        let busy               = false;
+
+        function setExportProgress(label, pct) {
+          exportBtn.textContent = label;
+          exportProgressWrap.style.display = '';
+          exportBar.style.width = pct + '%';
+        }
+
+        function setImportProgress(label, pct) {
+          importBtn.textContent = label;
+          importProgressWrap.style.display = '';
+          importBar.style.width = pct + '%';
+        }
+
+        exportBtn.addEventListener('click', async () => {
+          if (busy) return;
+          busy = true;
+          exportBtn.disabled = true;
+          importBtn.disabled = true;
+          exportBtn.classList.add('pr-loading');
+          const origText = exportBtn.textContent;
+
+          try {
+            const result = await exportSaveData((label, pct) => setExportProgress(label, pct));
+            if (result.ok) {
+              setExportProgress('Done! (' + result.kb + ' KB)', 100);
+              exportBtn.classList.remove('pr-loading');
+              showToast('✅ Save data exported — ' + result.kb + ' KB');
+              setTimeout(() => {
+                exportProgressWrap.style.display = 'none';
+                exportBar.style.width = '0%';
+                exportBtn.textContent = origText;
+              }, 2000);
+            } else if (result.reason === 'connect') {
+              showToast('⚠️ No game data found — open a save first', true);
+              exportBtn.textContent = origText;
+              exportProgressWrap.style.display = 'none';
+              exportBtn.classList.remove('pr-loading');
+            } else {
+              showToast('⚠️ Export failed: ' + (result.error || result.reason), true);
+              exportBtn.textContent = origText;
+              exportProgressWrap.style.display = 'none';
+              exportBtn.classList.remove('pr-loading');
+            }
+          } catch (e) {
+            showToast('⚠️ Export failed: ' + e.message, true);
+            exportBtn.textContent = origText;
+            exportProgressWrap.style.display = 'none';
+            exportBtn.classList.remove('pr-loading');
+          } finally {
+            busy = false;
+            exportBtn.disabled = false;
+            importBtn.disabled = !selectedFile;
+          }
+        });
+
+        chooseBtn.addEventListener('click', () => { if (!busy) fileInput.click(); });
+
+        fileInput.addEventListener('change', () => {
+          const file = fileInput.files?.[0];
+          if (file) {
+            selectedFile = file;
+            filenameEl.textContent = file.name;
+            filenameEl.style.color = '#e0e8ff';
+            const kb = Math.round(file.size / 1024);
+            const modified = new Date(file.lastModified).toLocaleDateString(undefined, { month: 'numeric', day: 'numeric', year: 'numeric' });
+            fileinfoEl.textContent = kb + ' KB  ·  modified ' + modified;
+            fileinfoEl.style.display = '';
+            importBtn.disabled = false;
+          }
+        });
+
+        importBtn.addEventListener('click', async () => {
+          if (!selectedFile || busy) return;
+
+          const confirmed = globalThis.confirm(
+            '⚠️ This will overwrite your current in-memory save data with the contents of:\n\n' +
+            selectedFile.name + '\n\nThis cannot be undone. Continue?'
+          );
+          if (!confirmed) return;
+
+          busy = true;
+          importBtn.disabled = true;
+          exportBtn.disabled = true;
+          chooseBtn.disabled = true;
+          importBtn.classList.add('pr-loading');
+          const origText = importBtn.textContent;
+
+          try {
+            setImportProgress('Reading file… 0%', 0);
+            await waitTick();
+            const text = await selectedFile.text();
+            setImportProgress('Parsing… 20%', 20);
+            await waitTick();
+
+            const result = await importSaveData(text, (_done, _total, pct) => {
+              const clamped = 20 + Math.round(pct * 0.7);
+              setImportProgress('Restoring… ' + pct + '%', clamped);
+            });
+
+            if (result.ok) {
+              setImportProgress('Saving… 95%', 95);
+              await waitTick();
+              setImportProgress('Done!', 100);
+              importBtn.classList.remove('pr-loading');
+              showToast('✅ Imported — ' + result.restored + ' fields restored');
+              setTimeout(() => {
+                importProgressWrap.style.display = 'none';
+                importBar.style.width = '0%';
+                importBtn.textContent = origText;
+              }, 2000);
+            } else if (result.reason === 'connect') {
+              showToast('⚠️ No game data found — open a save first', true);
+              importBtn.textContent = origText;
+              importProgressWrap.style.display = 'none';
+              importBtn.classList.remove('pr-loading');
+            } else if (result.reason === 'syntax') {
+              showToast('⚠️ JSON syntax error — file may be corrupted or incomplete', true);
+              importBtn.textContent = origText;
+              importProgressWrap.style.display = 'none';
+              importBtn.classList.remove('pr-loading');
+            } else if (result.reason === 'parse') {
+              showToast('⚠️ Invalid save file: ' + (result.error || 'parse error'), true);
+              importBtn.textContent = origText;
+              importProgressWrap.style.display = 'none';
+              importBtn.classList.remove('pr-loading');
+            } else if (result.reason === 'invalid') {
+              showToast('⚠️ ' + (result.error || 'Not a valid PokeRogue save file'), true);
+              importBtn.textContent = origText;
+              importProgressWrap.style.display = 'none';
+              importBtn.classList.remove('pr-loading');
+            } else {
+              showToast('⚠️ Import failed: ' + (result.error || result.reason), true);
+              importBtn.textContent = origText;
+              importProgressWrap.style.display = 'none';
+              importBtn.classList.remove('pr-loading');
+            }
+          } catch (e) {
+            showToast('⚠️ Import failed: ' + e.message, true);
+            importBtn.textContent = origText;
+            importProgressWrap.style.display = 'none';
+            importBtn.classList.remove('pr-loading');
+          } finally {
+            busy = false;
+            importBtn.disabled = false;
+            exportBtn.disabled = false;
+            chooseBtn.disabled = false;
+          }
+        });
+
+        return function tick() {
+          const gd = findGameData();
+          if (!gd) { statsEl.textContent = 'waiting for game connection…'; return; }
+          const parts = [];
+          if (gd.dexData) {
+            const keys = Object.keys(gd.dexData);
+            const caught = keys.filter(k => gd.dexData[k]?.caughtAttr).length;
+            parts.push('Pokédex ' + caught + ' / ' + keys.length);
+          }
+          if (Array.isArray(gd.eggs)) parts.push(gd.eggs.length + ' egg' + (gd.eggs.length !== 1 ? 's' : ''));
+          if (gd.achvUnlocks) {
+            const count = Object.keys(gd.achvUnlocks).length;
+            if (count > 0) parts.push(count + ' achievement' + (count !== 1 ? 's' : ''));
+          }
+          if (gd.voucherCounts) {
+            const total = Object.values(gd.voucherCounts).reduce((s, v) => s + (v || 0), 0);
+            if (total > 0) parts.push(total + ' voucher' + (total !== 1 ? 's' : ''));
+          }
+          statsEl.textContent = parts.length ? parts.join(' · ') : 'No summary data available';
+        };
+      }
+    },
     // add more sections here
   ];
 
@@ -1083,6 +1426,17 @@
       // footer
       '#pr-footer{flex-shrink:0;padding:8px 16px 12px;font-size:15px;color:#8a9ab8;text-align:center;letter-spacing:.05em}',
       '#pr-footer kbd{background:#1e2840;border:1px solid #3a4e6a;border-radius:4px;padding:2px 7px;font-family:inherit;color:#a0b0d0}',
+
+      // save data warning card
+      '.pr-save-warn-card{background:#1e1408;border-color:#7a4c00}',
+
+      // save data progress bar
+      '.pr-save-progress-wrap{height:4px;background:#1a2235;border-radius:2px;overflow:hidden;margin-bottom:2px}',
+      '.pr-save-progress-bar{height:100%;width:0%;background:linear-gradient(90deg,#22c55e,#4ade80);border-radius:2px;transition:width .3s ease}',
+
+      // save data stats & file info
+      '.pr-save-stats{font-size:14px;color:#7c8fff;letter-spacing:.04em;padding:2px 0;min-height:18px}',
+      '.pr-save-fileinfo{font-size:13px;color:#6a7a9a;letter-spacing:.04em;padding:1px 0}',
     ].join('\n');
 
     style.textContent = css;
