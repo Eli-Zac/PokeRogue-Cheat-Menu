@@ -10,6 +10,7 @@
 // @match        *://playpokerogue.com/*
 // @match        *://www.playpokerogue.com/*
 // @grant        unsafeWindow
+// @grant        GM_download
 // ==/UserScript==
 
 (function () {
@@ -31,6 +32,14 @@
 
   let _game = null;
 
+  function isPhaserGameCandidate(v) {
+    return Boolean(v?.scene && Array.isArray(v.scene.scenes) && v.renderer);
+  }
+
+  function hasGameDataScene(v) {
+    return Boolean(v?.scene?.scenes?.some(sc => sc?.gameData));
+  }
+
   function hookPhaserConstructor() {
     if (!uw.Phaser?.Game || uw.Phaser.Game.__prHooked) return;
     const Orig = uw.Phaser.Game;
@@ -44,25 +53,39 @@
     Object.keys(Orig).forEach(k => { try { uw.Phaser.Game[k] = Orig[k]; } catch (_) {} });
   }
 
-  function getPhaserGame() {
-    if (_game?.scene) return _game;
+  function getPhaserGame(forceRescan = false) {
+    if (!forceRescan && isPhaserGameCandidate(_game)) return _game;
+
     let keys = [];
     try { keys = Object.getOwnPropertyNames(uw); } catch (_) {
       try { keys = Object.keys(uw); } catch (_) {}
     }
+
+    let fallback = null;
     for (const k of keys) {
       try {
         const v = uw[k];
-        if (v?.scene && Array.isArray(v.scene.scenes) && v.scene.scenes.length > 0 && v.renderer) {
-          _game = v; return _game;
+        if (!isPhaserGameCandidate(v)) continue;
+        if (hasGameDataScene(v)) {
+          _game = v;
+          return _game;
         }
+        if (!fallback && v.scene.scenes.length > 0) fallback = v;
       } catch (_) {}
     }
+
+    if (fallback) {
+      _game = fallback;
+      return _game;
+    }
+
     return null;
   }
 
   function findGameScene() {
-    return getPhaserGame()?.scene?.scenes?.find(sc => sc?.gameData) ?? null;
+    const cachedScene = _game?.scene?.scenes?.find(sc => sc?.gameData);
+    if (cachedScene) return cachedScene;
+    return getPhaserGame(Boolean(_game))?.scene?.scenes?.find(sc => sc?.gameData) ?? null;
   }
 
   function findGachaHandler() {
@@ -113,6 +136,212 @@
     const handler = findGachaHandler();
     if (handler && typeof handler.updateVoucherCounts === 'function') handler.updateVoucherCounts();
     return true;
+  }
+
+  // ─── GOLD / CURRENCY HACKS ─────────────────────────────────────────────
+
+  const GOLD_KEY_CANDIDATES = ['gold', 'money', 'coins', 'coin', 'currency', 'cash'];
+  const GOLD_GETTER_METHODS = ['getGold', 'getMoney', 'getCoins', 'getCurrency', 'getCash'];
+  const GOLD_SETTER_METHODS = ['setGold', 'setMoney', 'setCoins', 'setCurrency', 'setCash', 'updateMoney'];
+  const GOLD_ADDER_METHODS = ['addGold', 'addMoney', 'addCoins', 'addCurrency', 'addCash', 'gainMoney'];
+  const CURRENCY_KEY_REGEX = /(gold|money|coin|currency|cash|fund)/i;
+
+  function isNumberLike(v) {
+    return typeof v === 'number' || typeof v === 'bigint';
+  }
+
+  function findCurrencyOnObject(obj) {
+    if (!obj || typeof obj !== 'object') return null;
+
+    for (const key of GOLD_KEY_CANDIDATES) {
+      try {
+        if (isNumberLike(obj[key])) return { holder: obj, key };
+      } catch (_) {}
+    }
+
+    const keys = Object.keys(obj);
+    for (const key of keys) {
+      if (!CURRENCY_KEY_REGEX.test(key)) continue;
+      try {
+        const v = obj[key];
+        if (isNumberLike(v)) return { holder: obj, key };
+        if (v && typeof v === 'object') {
+          if (isNumberLike(v.value)) return { holder: v, key: 'value' };
+          if (isNumberLike(v.amount)) return { holder: v, key: 'amount' };
+          if (isNumberLike(v.current)) return { holder: v, key: 'current' };
+        }
+      } catch (_) {}
+    }
+
+    return null;
+  }
+
+  function findCurrencyDeep(root, maxDepth = 4) {
+    if (!root || typeof root !== 'object') return null;
+
+    const visited = new WeakSet();
+    const queue = [{ node: root, depth: 0 }];
+
+    while (queue.length > 0) {
+      const current = queue.shift();
+      const node = current.node;
+      const depth = current.depth;
+
+      if (!node || typeof node !== 'object') continue;
+      if (visited.has(node)) continue;
+      visited.add(node);
+
+      const direct = findCurrencyOnObject(node);
+      if (direct) return direct;
+
+      if (depth >= maxDepth) continue;
+
+      let keys = [];
+      try {
+        keys = Object.keys(node);
+      } catch (_) {
+        continue;
+      }
+
+      for (const key of keys) {
+        let child;
+        try {
+          child = node[key];
+        } catch (_) {
+          continue;
+        }
+        if (!child || typeof child !== 'object') continue;
+        if (Array.isArray(child) && child.length > 100) continue;
+        queue.push({ node: child, depth: depth + 1 });
+      }
+    }
+
+    return null;
+  }
+
+  function callFirstNumberGetter(target) {
+    if (!target) return null;
+    for (const name of GOLD_GETTER_METHODS) {
+      const fn = target[name];
+      if (typeof fn !== 'function') continue;
+      try {
+        const v = fn.call(target);
+        if (typeof v === 'number') return v;
+        if (typeof v === 'bigint') return Number(v);
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  function callFirstSetter(target, next) {
+    if (!target) return false;
+    for (const name of GOLD_SETTER_METHODS) {
+      const fn = target[name];
+      if (typeof fn !== 'function') continue;
+      try {
+        fn.call(target, next);
+        return true;
+      } catch (_) {}
+    }
+    return false;
+  }
+
+  function callFirstAdder(target, delta) {
+    if (!target) return false;
+    for (const name of GOLD_ADDER_METHODS) {
+      const fn = target[name];
+      if (typeof fn !== 'function') continue;
+      try {
+        fn.call(target, delta);
+        return true;
+      } catch (_) {}
+    }
+    return false;
+  }
+
+  function findCurrencyField() {
+    const gd = findGameData();
+    const scene = findGameScene();
+
+    return findCurrencyOnObject(gd)
+      || findCurrencyOnObject(gd?.sessionData)
+      || findCurrencyOnObject(scene)
+      || findCurrencyDeep(gd)
+      || findCurrencyDeep(scene)
+      || null;
+  }
+
+  function getGoldAmount() {
+    const ref = findCurrencyField();
+    if (!ref) return null;
+    try {
+      const raw = ref.holder[ref.key];
+      if (typeof raw === 'bigint') return Number(raw);
+      if (typeof raw === 'number') return raw;
+    } catch (_) {}
+
+    const gd = findGameData();
+    const scene = findGameScene();
+    return callFirstNumberGetter(gd) ?? callFirstNumberGetter(scene) ?? null;
+
+  }
+
+  function setGoldAmount(amount) {
+    const next = Math.max(0, Math.floor(Number(amount) || 0));
+    const gd = findGameData();
+    const scene = findGameScene();
+
+    // Try game setter methods first — these notify the UI
+    if (callFirstSetter(gd, next)) return true;
+    if (callFirstSetter(scene, next)) return true;
+
+    // Try adder with delta — also notifies the UI
+    const current = getGoldAmount();
+    if (current !== null) {
+      const delta = next - current;
+      if (callFirstAdder(gd, delta)) return true;
+      if (callFirstAdder(scene, delta)) return true;
+    }
+
+    // Last resort: raw field write (data only, no UI refresh)
+    const ref = findCurrencyField();
+    if (ref) {
+      try {
+        ref.holder[ref.key] = typeof ref.holder[ref.key] === 'bigint' ? BigInt(next) : next;
+        return true;
+      } catch (_) {}
+    }
+
+    return false;
+  }
+
+  function addGoldAmount(delta) {
+    const amount = Math.floor(Number(delta) || 0);
+    const gd = findGameData();
+    const scene = findGameScene();
+
+    // Try adder methods first — these notify the UI
+    if (callFirstAdder(gd, amount)) return true;
+    if (callFirstAdder(scene, amount)) return true;
+
+    // Try setter with new value
+    const current = getGoldAmount();
+    if (current !== null) {
+      const next = Math.max(0, current + amount);
+      if (callFirstSetter(gd, next)) return true;
+      if (callFirstSetter(scene, next)) return true;
+
+      // Last resort: raw field write
+      const ref = findCurrencyField();
+      if (ref) {
+        try {
+          ref.holder[ref.key] = typeof ref.holder[ref.key] === 'bigint' ? BigInt(next) : next;
+          return true;
+        } catch (_) {}
+      }
+    }
+
+    return false;
   }
 
   // ─── EGG LIMIT HACK ──────────────────────────────────────────────────────
@@ -507,6 +736,70 @@
   const FULL_DEX_ATTR = (1n << 12n) - 1n; // 4095n
   // All 25 natures unlocked (bits 0-24)
   const FULL_NATURE_ATTR = (1 << 25) - 1;
+  let _defaultDexSnapshot = null;
+
+  function cloneScalarForSnapshot(value) {
+    if (typeof value === 'bigint') return BigInt(value.toString());
+    return value;
+  }
+
+  function captureDefaultDexSnapshot() {
+    if (_defaultDexSnapshot) return true;
+    const gd = findGameData();
+    if (!gd?.dexData) return false;
+
+    const snapshot = {};
+    for (const key of Object.keys(gd.dexData)) {
+      const entry = gd.dexData[key];
+      if (!entry) continue;
+      snapshot[key] = {
+        caughtAttr: cloneScalarForSnapshot(entry.caughtAttr),
+        seenAttr: cloneScalarForSnapshot(entry.seenAttr),
+        caughtCount: cloneScalarForSnapshot(entry.caughtCount),
+        seenCount: cloneScalarForSnapshot(entry.seenCount),
+        natureAttr: cloneScalarForSnapshot(entry.natureAttr),
+      };
+    }
+
+    _defaultDexSnapshot = snapshot;
+    return true;
+  }
+
+  async function restoreDefaultPokemon(onProgress) {
+    const gd = findGameData();
+    if (!gd?.dexData) return { ok: false, updated: 0, reason: 'connect' };
+    if (!_defaultDexSnapshot && !captureDefaultDexSnapshot()) {
+      return { ok: false, updated: 0, reason: 'snapshot' };
+    }
+
+    const keys = Object.keys(gd.dexData);
+    const total = keys.length;
+    let updated = 0;
+
+    if (typeof onProgress === 'function') onProgress(0, total, 0);
+
+    for (let i = 0; i < keys.length; i++) {
+      const key = keys[i];
+      const entry = gd.dexData[key];
+      const snap = _defaultDexSnapshot?.[key];
+      if (!entry || !snap) continue;
+
+      entry.caughtAttr = cloneScalarForSnapshot(snap.caughtAttr);
+      entry.seenAttr = cloneScalarForSnapshot(snap.seenAttr);
+      entry.caughtCount = cloneScalarForSnapshot(snap.caughtCount);
+      entry.seenCount = cloneScalarForSnapshot(snap.seenCount);
+      entry.natureAttr = cloneScalarForSnapshot(snap.natureAttr);
+      updated++;
+
+      if (typeof onProgress === 'function' && i % 50 === 0) {
+        onProgress(updated, total, Math.round((updated / total) * 100));
+        await waitTick();
+      }
+    }
+
+    await triggerAutosaveAfterEggChange();
+    return { ok: true, updated };
+  }
 
   function getDexStats() {
     const gd = findGameData();
@@ -605,7 +898,7 @@
   // ─── GAME STATS ──────────────────────────────────────────────────────────
 
   const STAT_LABELS = {
-    playTime:                  'Play Time (seconds)',
+    playTime:                  'Play Time',
     battles:                   'Battles',
     classicSessionsPlayed:     'Classic Sessions Played',
     endlessSessionsPlayed:     'Endless Sessions Played',
@@ -643,6 +936,20 @@
     return Object.keys(stats).length ? stats : null;
   }
 
+  function formatPlayTime(seconds) {
+    const total = Math.max(0, Math.floor(Number(seconds) || 0));
+    const d = Math.floor(total / 86400);
+    const h = Math.floor((total % 86400) / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    return d + 'd ' + h + 'h ' + m + 'm ' + s + 's';
+  }
+
+  function formatGameStatValue(key, value) {
+    if (key === 'playTime') return formatPlayTime(value);
+    return value.toLocaleString();
+  }
+
   // ─── SAVE DATA ───────────────────────────────────────────────────────────
 
   // Keys that represent persistent game progress on gameData
@@ -653,49 +960,286 @@
     'gameStats', 'sessionData',
   ];
 
+  const DOWNLOAD_BRIDGE_REQUEST = 'PRCM_EXPORT_DOWNLOAD_REQUEST';
+  const DOWNLOAD_BRIDGE_RESPONSE = 'PRCM_EXPORT_DOWNLOAD_RESPONSE';
+
+  function safeCloneForSave(value, seen = new WeakSet()) {
+    if (value === null) return null;
+
+    const t = typeof value;
+    if (t === 'string' || t === 'number' || t === 'boolean') return value;
+    if (t === 'bigint') return { __type: 'BigInt', __value: value.toString() };
+    if (t === 'undefined' || t === 'function' || t === 'symbol') return undefined;
+
+    if (seen.has(value)) return undefined;
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+      const out = [];
+      for (let i = 0; i < value.length; i++) {
+        let entry;
+        try {
+          entry = value[i];
+        } catch (_) {
+          out.push(null);
+          continue;
+        }
+        const cloned = safeCloneForSave(entry, seen);
+        out.push(cloned === undefined ? null : cloned);
+      }
+      return out;
+    }
+
+    const out = {};
+    for (const key of Object.keys(value)) {
+      let entry;
+      try {
+        entry = value[key];
+      } catch (_) {
+        continue;
+      }
+      const cloned = safeCloneForSave(entry, seen);
+      if (cloned !== undefined) out[key] = cloned;
+    }
+    return out;
+  }
+
+  function buildExportPayload(gd) {
+    const payload = {};
+    for (const key of SAVE_DATA_KEYS) {
+      let raw;
+      try {
+        raw = gd[key];
+      } catch (_) {
+        continue;
+      }
+      const cloned = safeCloneForSave(raw);
+      if (cloned !== undefined) payload[key] = cloned;
+    }
+    payload.__meta = {
+      source: 'PokeRogue Cheat Menu',
+      version: getScriptVersion(),
+      exportedAt: new Date().toISOString(),
+    };
+    return payload;
+  }
+
+  function isTrustedBridgeOrigin(origin) {
+    if (!origin || origin === 'null') return false;
+    try {
+      const host = new URL(origin).hostname.toLowerCase();
+      return /(^|\.)pokerogue\.net$/.test(host) || /(^|\.)playpokerogue\.com$/.test(host);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function resolveDownloadFilename(rawName) {
+    if (typeof rawName !== 'string' || rawName.trim() === '') {
+      const ts = new Date().toISOString().replace(/[T:]/g, '-').replace(/\..+/, '');
+      return 'pokerogue-save-' + ts + '.json';
+    }
+    return rawName;
+  }
+
+  function downloadWithAnchor(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+
+  async function downloadWithFilePicker(jsonText, filename) {
+    if (typeof window.showSaveFilePicker !== 'function') {
+      throw new Error('showSaveFilePicker unavailable');
+    }
+
+    const handle = await window.showSaveFilePicker({
+      suggestedName: filename,
+      types: [{
+        description: 'JSON Files',
+        accept: { 'application/json': ['.json'] },
+      }],
+    });
+    const writable = await handle.createWritable();
+    try {
+      await writable.write(jsonText);
+    } finally {
+      await writable.close();
+    }
+  }
+
+  function downloadWithGM(blob, filename) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_download !== 'function') {
+        reject(new Error('GM_download unavailable'));
+        return;
+      }
+
+      const url = URL.createObjectURL(blob);
+      const cleanup = () => setTimeout(() => URL.revokeObjectURL(url), 2000);
+
+      try {
+        GM_download({
+          url,
+          name: filename,
+          saveAs: true,
+          onload: () => {
+            cleanup();
+            resolve(true);
+          },
+          onerror: (err) => {
+            cleanup();
+            reject(new Error(err?.error || err?.details || 'GM_download failed'));
+          },
+          ontimeout: () => {
+            cleanup();
+            reject(new Error('GM_download timed out'));
+          },
+        });
+      } catch (e) {
+        cleanup();
+        reject(e);
+      }
+    });
+  }
+
+  function requestParentDownload(jsonText, filename) {
+    return new Promise((resolve) => {
+      if (window.top === window.self) {
+        resolve(false);
+        return;
+      }
+
+      const requestId = 'prcm-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+      let finished = false;
+
+      const onMessage = (event) => {
+        const data = event?.data;
+        if (!data || data.type !== DOWNLOAD_BRIDGE_RESPONSE || data.requestId !== requestId) return;
+        if (!isTrustedBridgeOrigin(event.origin)) return;
+        finished = true;
+        window.removeEventListener('message', onMessage);
+        resolve(Boolean(data.ok));
+      };
+
+      window.addEventListener('message', onMessage);
+
+      try {
+        window.top.postMessage({
+          type: DOWNLOAD_BRIDGE_REQUEST,
+          requestId,
+          filename,
+          payload: jsonText,
+        }, '*');
+      } catch (_) {
+        window.removeEventListener('message', onMessage);
+        resolve(false);
+        return;
+      }
+
+      setTimeout(() => {
+        if (finished) return;
+        window.removeEventListener('message', onMessage);
+        resolve(false);
+      }, 2000);
+    });
+  }
+
+  async function triggerSaveDownload(jsonText, filename) {
+    const safeName = resolveDownloadFilename(filename);
+    const blob = new Blob([jsonText], { type: 'application/json' });
+
+    // Keep this first and as close to button click as possible to preserve user activation.
+    try {
+      await downloadWithFilePicker(jsonText, safeName);
+      return { ok: true, mode: 'picker' };
+    } catch (_) {}
+
+    try {
+      downloadWithAnchor(blob, safeName);
+      return { ok: true, mode: 'anchor' };
+    } catch (_) {}
+
+    // Embedded contexts can block direct blob downloads; ask the top frame first.
+    if (window.top !== window.self) {
+      try {
+        const bridged = await requestParentDownload(jsonText, safeName);
+        if (bridged) return { ok: true, mode: 'bridge' };
+      } catch (_) {}
+    }
+
+    try {
+      await downloadWithGM(blob, safeName);
+      return { ok: true, mode: 'gm' };
+    } catch (_) {}
+
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(jsonText);
+        return { ok: true, mode: 'clipboard' };
+      }
+    } catch (_) {}
+
+    throw new Error('All export download methods failed');
+  }
+
+  window.addEventListener('message', (event) => {
+    const data = event?.data;
+    if (!data || data.type !== DOWNLOAD_BRIDGE_REQUEST) return;
+    if (!isTrustedBridgeOrigin(event.origin)) return;
+    if (window.top !== window.self) return;
+
+    const requestId = data.requestId;
+    const payload = data.payload;
+    const filename = resolveDownloadFilename(data.filename);
+    let ok = false;
+
+    try {
+      if (typeof payload !== 'string' || payload.length === 0) throw new Error('empty payload');
+      downloadWithAnchor(new Blob([payload], { type: 'application/json' }), filename);
+      ok = true;
+    } catch (_) {
+      ok = false;
+    }
+
+    try {
+      event.source?.postMessage({
+        type: DOWNLOAD_BRIDGE_RESPONSE,
+        requestId,
+        ok,
+      }, event.origin || '*');
+    } catch (_) {}
+  });
+
   async function exportSaveData(onProgress) {
     const gd = findGameData();
     if (!gd) return { ok: false, reason: 'connect' };
 
     if (typeof onProgress === 'function') onProgress('Collecting data\u2026', 10);
-    await new Promise(r => setTimeout(r, 400));
 
-    const seen = new WeakSet();
     let json;
     try {
       if (typeof onProgress === 'function') onProgress('Serializing\u2026', 35);
-      await new Promise(r => setTimeout(r, 350));
-      json = JSON.stringify(gd, function (key, value) {
-        if (typeof value === 'function') return undefined;
-        if (typeof value === 'bigint') return { __type: 'BigInt', __value: value.toString() };
-        if (typeof value === 'object' && value !== null) {
-          if (seen.has(value)) return undefined;
-          seen.add(value);
-        }
-        return value;
-      }, 2);
+      const payload = buildExportPayload(gd);
+      json = JSON.stringify(payload, null, 2);
     } catch (e) {
       return { ok: false, reason: 'serialize', error: e.message };
     }
 
     try {
       if (typeof onProgress === 'function') onProgress('Packaging file\u2026', 70);
-      await new Promise(r => setTimeout(r, 350));
       const kb = Math.round(json.length / 1024);
-      const blob = new Blob([json], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
       const ts = new Date().toISOString().replace(/[T:]/g, '-').replace(/\..+/, '');
-      a.download = 'pokerogue-save-' + ts + '.json';
-      document.body.appendChild(a);
+      const filename = 'pokerogue-save-' + ts + '.json';
       if (typeof onProgress === 'function') onProgress('Downloading\u2026', 90);
-      await new Promise(r => setTimeout(r, 300));
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      const dl = await triggerSaveDownload(json, filename);
       if (typeof onProgress === 'function') onProgress('Done!', 100);
-      return { ok: true, kb };
+      return { ok: true, kb, mode: dl.mode };
     } catch (e) {
       return { ok: false, reason: 'download', error: e.message };
     }
@@ -1026,12 +1570,12 @@
           <div class="pr-card">
             <div class="pr-card-header">
               <div class="pr-card-title">Pokédex</div>
-              <div class="pr-card-desc">Mark every Pokémon as caught, or reset all caught status with confirmation</div>
+              <div class="pr-card-desc">Mark every Pokémon as caught, or restore to default Pokédex state with confirmation</div>
             </div>
             <div class="pr-dex-stats" id="pr-dex-stats">—</div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
               <button class="pr-btn green" id="pr-catch-all">✓ Catch All Pokémon</button>
-              <button class="pr-btn red" id="pr-reset-caught">↺ Reset Caught Status</button>
+              <button class="pr-btn red" id="pr-reset-caught">↩ Restore Default Pokémon</button>
             </div>
           </div>
         `;
@@ -1040,6 +1584,73 @@
         const catchBtn = container.querySelector('#pr-catch-all');
         const resetBtn = container.querySelector('#pr-reset-caught');
         let busy = false;
+        const OPERATION_PROGRESS_WEIGHT = 0.8;
+        const ANIMATION_PROGRESS_WEIGHT = 0.2;
+        let dexAnimRaf = null;
+        let dexAnimating = false;
+        let displayedCaught = null;
+        let displayedTotal = null;
+
+        function renderDexText(caught, total) {
+          displayedCaught = caught;
+          displayedTotal = total;
+          statsEl.textContent = caught + ' / ' + total + ' caught';
+        }
+
+        function setDexButtonProgress(btn, label, operationPct, animationPct) {
+          const op = Math.max(0, Math.min(100, Number(operationPct) || 0));
+          const anim = Math.max(0, Math.min(100, Number(animationPct) || 0));
+          const combined = Math.round((op * OPERATION_PROGRESS_WEIGHT) + (anim * ANIMATION_PROGRESS_WEIGHT));
+          btn.textContent = label + ' ' + combined + '%';
+        }
+
+        async function animateDexCounts(targetCaught, targetTotal, onProgress) {
+          const startCaught = displayedCaught ?? targetCaught;
+          const startTotal = displayedTotal ?? targetTotal;
+          if (typeof onProgress === 'function') onProgress(0);
+
+          if (startCaught === targetCaught && startTotal === targetTotal) {
+            renderDexText(targetCaught, targetTotal);
+            if (typeof onProgress === 'function') onProgress(100);
+            return;
+          }
+
+          if (dexAnimRaf) {
+            cancelAnimationFrame(dexAnimRaf);
+            dexAnimRaf = null;
+          }
+
+          const delta = Math.max(
+            Math.abs(targetCaught - startCaught),
+            Math.abs(targetTotal - startTotal),
+          );
+          const duration = Math.min(900, Math.max(280, 180 + delta * 2));
+          const start = performance.now();
+          dexAnimating = true;
+
+          await new Promise(resolve => {
+            const step = (now) => {
+              const t = Math.min(1, (now - start) / duration);
+              const eased = 1 - Math.pow(1 - t, 3);
+
+              const currentCaught = Math.round(startCaught + (targetCaught - startCaught) * eased);
+              const currentTotal = Math.round(startTotal + (targetTotal - startTotal) * eased);
+              renderDexText(currentCaught, currentTotal);
+              if (typeof onProgress === 'function') onProgress(Math.round(t * 100));
+
+              if (t >= 1) {
+                dexAnimating = false;
+                dexAnimRaf = null;
+                renderDexText(targetCaught, targetTotal);
+                if (typeof onProgress === 'function') onProgress(100);
+                resolve();
+                return;
+              }
+              dexAnimRaf = requestAnimationFrame(step);
+            };
+            dexAnimRaf = requestAnimationFrame(step);
+          });
+        }
 
         function setBusyState(nextBusy) {
           busy = nextBusy;
@@ -1055,12 +1666,25 @@
           setBusyState(true);
           catchBtn.classList.add('pr-loading');
           const origText = catchBtn.textContent;
+          let operationPct = 0;
+          let animationPct = 0;
 
           try {
             const result = await catchAllPokemon((_done, _total, pct) => {
-              catchBtn.textContent = 'Working… ' + pct + '%';
+              operationPct = pct;
+              setDexButtonProgress(catchBtn, 'Working…', operationPct, animationPct);
             });
             if (result.ok) {
+              operationPct = 100;
+              animationPct = 0;
+              setDexButtonProgress(catchBtn, 'Working…', operationPct, animationPct);
+              const stats = getDexStats();
+              if (stats) {
+                await animateDexCounts(stats.caught, stats.total, (pct) => {
+                  animationPct = pct;
+                  setDexButtonProgress(catchBtn, 'Working…', operationPct, animationPct);
+                });
+              }
               showToast('✅ Caught ' + result.updated + ' Pokémon!');
             } else {
               showToast('⚠️ Open a game save first', true);
@@ -1077,19 +1701,34 @@
           const gd = findGameData();
           if (!gd?.dexData) { showToast('⚠️ No game data found', true); return; }
 
-          const confirmed = globalThis.confirm('⚠️ This will mark all Pokémon as uncaught in your Pokédex. Continue?');
+          const confirmed = globalThis.confirm('⚠️ Restore Pokémon progress to the default captured state from when this page first connected?');
           if (!confirmed) return;
 
           setBusyState(true);
           resetBtn.classList.add('pr-loading');
           const origText = resetBtn.textContent;
+          let operationPct = 0;
+          let animationPct = 0;
 
           try {
-            const result = await resetCaughtPokemon((_done, _total, pct) => {
-              resetBtn.textContent = 'Resetting… ' + pct + '%';
+            const result = await restoreDefaultPokemon((_done, _total, pct) => {
+              operationPct = pct;
+              setDexButtonProgress(resetBtn, 'Restoring…', operationPct, animationPct);
             });
             if (result.ok) {
-              showToast('✅ Reset caught status for ' + result.updated + ' Pokémon');
+              operationPct = 100;
+              animationPct = 0;
+              setDexButtonProgress(resetBtn, 'Restoring…', operationPct, animationPct);
+              const stats = getDexStats();
+              if (stats) {
+                await animateDexCounts(stats.caught, stats.total, (pct) => {
+                  animationPct = pct;
+                  setDexButtonProgress(resetBtn, 'Restoring…', operationPct, animationPct);
+                });
+              }
+              showToast('✅ Restored default Pokémon state for ' + result.updated + ' entries');
+            } else if (result.reason === 'snapshot') {
+              showToast('⚠️ Default snapshot not available yet. Wait a moment and try again.', true);
             } else {
               showToast('⚠️ Open a game save first', true);
             }
@@ -1101,11 +1740,159 @@
         });
 
         return function tick() {
+          captureDefaultDexSnapshot();
           const stats = getDexStats();
           if (stats) {
-            statsEl.textContent = stats.caught + ' / ' + stats.total + ' caught';
+            if (!dexAnimating && (displayedCaught !== stats.caught || displayedTotal !== stats.total)) {
+              renderDexText(stats.caught, stats.total);
+            }
           } else {
+            if (dexAnimRaf) {
+              cancelAnimationFrame(dexAnimRaf);
+              dexAnimRaf = null;
+            }
+            dexAnimating = false;
+            displayedCaught = null;
+            displayedTotal = null;
             statsEl.textContent = 'waiting for game connection';
+          }
+        };
+      }
+    },
+    {
+      id: 'gold',
+      icon: '💰',
+      label: 'Gold',
+      description: 'View, set, or add currency',
+      buildContent(container) {
+        container.innerHTML = `
+          <div class="pr-card">
+            <div class="pr-card-header">
+              <div class="pr-card-title">Gold / Currency</div>
+              <div class="pr-card-desc">Set exact value or add more to your current amount</div>
+            </div>
+            <div class="pr-dex-stats" id="pr-gold-current">—</div>
+            <input class="pr-input" id="pr-gold-input" type="number" min="0" step="1" placeholder="Amount">
+            <div class="pr-btn-row">
+              <button class="pr-btn green" id="pr-gold-set">✓ Set</button>
+              <button class="pr-btn purple" id="pr-gold-add">+ Add</button>
+              <button class="pr-btn" id="pr-gold-add-10k">+10,000</button>
+            </div>
+          </div>
+        `;
+
+        const currentEl = container.querySelector('#pr-gold-current');
+        const inputEl = container.querySelector('#pr-gold-input');
+        const setBtn = container.querySelector('#pr-gold-set');
+        const addBtn = container.querySelector('#pr-gold-add');
+        const add10kBtn = container.querySelector('#pr-gold-add-10k');
+        let busy = false;
+
+        function parseInputAmount() {
+          const raw = inputEl.value.trim();
+          if (raw === '') return null;
+          const val = Math.floor(Number(raw));
+          if (!Number.isFinite(val) || val < 0) return null;
+          return val;
+        }
+
+        async function afterCurrencyChange() {
+          await triggerAutosaveAfterEggChange();
+        }
+
+        setBtn.addEventListener('click', async () => {
+          if (busy) return;
+          const val = parseInputAmount();
+          if (val === null) {
+            showToast('⚠️ Enter a valid non-negative amount', true);
+            return;
+          }
+
+          busy = true;
+          setBtn.disabled = true;
+          addBtn.disabled = true;
+          add10kBtn.disabled = true;
+
+          try {
+            if (!setGoldAmount(val)) {
+              showToast('⚠️ Could not find currency field in game data', true);
+              return;
+            }
+            await afterCurrencyChange();
+            showToast('✅ Currency set to ' + val.toLocaleString());
+          } finally {
+            setBtn.disabled = false;
+            addBtn.disabled = false;
+            add10kBtn.disabled = false;
+            busy = false;
+          }
+        });
+
+        addBtn.addEventListener('click', async () => {
+          if (busy) return;
+          const val = parseInputAmount();
+          if (val === null) {
+            showToast('⚠️ Enter a valid non-negative amount', true);
+            return;
+          }
+
+          busy = true;
+          setBtn.disabled = true;
+          addBtn.disabled = true;
+          add10kBtn.disabled = true;
+
+          try {
+            if (!addGoldAmount(val)) {
+              showToast('⚠️ Could not find currency field in game data', true);
+              return;
+            }
+            await afterCurrencyChange();
+            showToast('✅ Added ' + val.toLocaleString() + ' currency');
+          } finally {
+            setBtn.disabled = false;
+            addBtn.disabled = false;
+            add10kBtn.disabled = false;
+            busy = false;
+          }
+        });
+
+        add10kBtn.addEventListener('click', async () => {
+          if (busy) return;
+
+          busy = true;
+          setBtn.disabled = true;
+          addBtn.disabled = true;
+          add10kBtn.disabled = true;
+
+          try {
+            if (!addGoldAmount(10000)) {
+              showToast('⚠️ Could not find currency field in game data', true);
+              return;
+            }
+            await afterCurrencyChange();
+            showToast('✅ Added 10,000 currency');
+          } finally {
+            setBtn.disabled = false;
+            addBtn.disabled = false;
+            add10kBtn.disabled = false;
+            busy = false;
+          }
+        });
+
+        inputEl.addEventListener('keydown', e => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            setBtn.click();
+          }
+          e.stopPropagation();
+        });
+
+        return function tick() {
+          const cur = getGoldAmount();
+          if (cur === null) {
+            currentEl.textContent = 'waiting for game connection';
+          } else {
+            currentEl.textContent = Math.max(0, Math.floor(cur)).toLocaleString() + ' currency';
           }
         };
       }
@@ -1169,6 +1956,9 @@
         const importBar        = container.querySelector('#pr-import-bar');
         let selectedFile       = null;
         let busy               = false;
+        const exportProgressQueue = [];
+        let exportProgressRunning = false;
+        let exportProgressLastPaint = 0;
 
         function setExportProgress(label, pct) {
           exportBtn.textContent = label;
@@ -1182,20 +1972,64 @@
           importBar.style.width = pct + '%';
         }
 
+        function sleep(ms) {
+          return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        function queueExportProgress(label, pct) {
+          exportProgressQueue.push({ label, pct: Math.max(0, Math.min(100, Number(pct) || 0)) });
+          if (!exportProgressRunning) void runExportProgressQueue();
+        }
+
+        async function runExportProgressQueue() {
+          exportProgressRunning = true;
+          const MIN_STAGE_MS = 220;
+
+          while (exportProgressQueue.length) {
+            const next = exportProgressQueue.shift();
+            const elapsed = Date.now() - exportProgressLastPaint;
+            if (exportProgressLastPaint && elapsed < MIN_STAGE_MS) {
+              await sleep(MIN_STAGE_MS - elapsed);
+            }
+            setExportProgress(next.label, next.pct);
+            exportProgressLastPaint = Date.now();
+          }
+
+          exportProgressRunning = false;
+        }
+
+        async function flushExportProgressQueue() {
+          while (exportProgressRunning || exportProgressQueue.length) {
+            await sleep(20);
+          }
+        }
+
+        function resetExportProgressQueue() {
+          exportProgressQueue.length = 0;
+          exportProgressRunning = false;
+          exportProgressLastPaint = 0;
+        }
+
         exportBtn.addEventListener('click', async () => {
           if (busy) return;
           busy = true;
+          resetExportProgressQueue();
           exportBtn.disabled = true;
           importBtn.disabled = true;
           exportBtn.classList.add('pr-loading');
           const origText = exportBtn.textContent;
 
           try {
-            const result = await exportSaveData((label, pct) => setExportProgress(label, pct));
+            const result = await exportSaveData((label, pct) => queueExportProgress(label, pct));
+            await flushExportProgressQueue();
             if (result.ok) {
               setExportProgress('Done! (' + result.kb + ' KB)', 100);
               exportBtn.classList.remove('pr-loading');
-              showToast('✅ Save data exported — ' + result.kb + ' KB');
+              if (result.mode === 'clipboard') {
+                showToast('✅ Export copied to clipboard (' + result.kb + ' KB)');
+              } else {
+                showToast('✅ Save data exported — ' + result.kb + ' KB');
+              }
               setTimeout(() => {
                 exportProgressWrap.style.display = 'none';
                 exportBar.style.width = '0%';
@@ -1205,17 +2039,20 @@
               showToast('⚠️ No game data found — open a save first', true);
               exportBtn.textContent = origText;
               exportProgressWrap.style.display = 'none';
+              resetExportProgressQueue();
               exportBtn.classList.remove('pr-loading');
             } else {
               showToast('⚠️ Export failed: ' + (result.error || result.reason), true);
               exportBtn.textContent = origText;
               exportProgressWrap.style.display = 'none';
+              resetExportProgressQueue();
               exportBtn.classList.remove('pr-loading');
             }
           } catch (e) {
             showToast('⚠️ Export failed: ' + e.message, true);
             exportBtn.textContent = origText;
             exportProgressWrap.style.display = 'none';
+            resetExportProgressQueue();
             exportBtn.classList.remove('pr-loading');
           } finally {
             busy = false;
@@ -1372,13 +2209,13 @@
             gridEl.innerHTML = Object.keys(stats).map(k =>
               '<div class="pr-stat-card">' +
                 '<div class="pr-stat-label">' + formatStatKey(k) + '</div>' +
-                '<div class="pr-stat-value" data-key="' + k + '">' + stats[k].toLocaleString() + '</div>' +
+                '<div class="pr-stat-value" data-key="' + k + '">' + formatGameStatValue(k, stats[k]) + '</div>' +
               '</div>'
             ).join('');
           } else {
             gridEl.querySelectorAll('.pr-stat-value').forEach(el => {
               const live = stats[el.dataset.key];
-              if (live !== undefined) el.textContent = live.toLocaleString();
+              if (live !== undefined) el.textContent = formatGameStatValue(el.dataset.key, live);
             });
           }
         }
@@ -1659,6 +2496,7 @@
       _statusTimer = setInterval(() => {
         const gd = findGameData();
         if (gd) {
+          captureDefaultDexSnapshot();
           dot.className = 'pr-dot on';
           statusText.textContent = 'Connected to game';
         } else {
@@ -1683,6 +2521,7 @@
   function showGUI() {
     const existing = document.getElementById('pr-cheat-gui');
     if (existing) {
+      existing._hideToken = (existing._hideToken || 0) + 1;
       existing.classList.remove('pr-closing');
       existing.style.display = '';
       // restart the open animation
@@ -1699,10 +2538,13 @@
   function hideGUI() {
     const el = document.getElementById('pr-cheat-gui');
     if (el) {
+      const hideToken = (el._hideToken || 0) + 1;
+      el._hideToken = hideToken;
       el._cleanup?.();
       el._goHome?.();
       el.classList.add('pr-closing');
       el.addEventListener('animationend', () => {
+        if (el._hideToken !== hideToken || guiVisible) return;
         el.classList.remove('pr-closing');
         el.style.display = 'none';
       }, { once: true });
