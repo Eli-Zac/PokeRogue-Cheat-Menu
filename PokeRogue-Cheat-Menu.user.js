@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokeRogue Cheat Menu
 // @namespace    https://github.com/Eli-Zac/PokeRogue-Cheat-Menu
-// @version      1.10
+// @version      1.11
 // @description  Cheat menu for PokeRogue
 // @author       Eli_Zac
 // @match        *://pokerogue.net/*
@@ -416,8 +416,22 @@
     return gd?.eggs?.length ?? null;
   }
 
+  function isManaphyEggEntry(egg) {
+    if (!egg || typeof egg !== 'object') return false;
+    if (typeof egg.isManaphyEgg === 'function') {
+      try {
+        return !!egg.isManaphyEgg();
+      } catch (_) {}
+    }
+
+    const species = egg.species;
+    const hasLegacySpecies = species === 0 || species === null || species === undefined;
+    return Number.isFinite(egg.id) && egg.id % 204 === 0 && (!Number.isFinite(egg.tier) || egg.tier === 0) && hasLegacySpecies;
+  }
+
   function getEggTypeFromEntry(egg) {
     if (!egg || typeof egg !== 'object') return null;
+    if (isManaphyEggEntry(egg)) return 4;
     const keys = ['gachaType', 'eggType', 'sourceType', 'type', 'tier'];
     for (const key of keys) {
       const v = egg[key];
@@ -434,17 +448,72 @@
     { value: 4, label: 'Manaphy' },
   ];
 
+  const EGG_SEED_LIMIT = 1073741824;
+  let _manaphyEggIdCursor = null;
+
   function getEggTargetTier(typeId) {
-    return typeId === 4 ? 2 : Math.max(0, Math.min(3, Number(typeId) || 0));
+    return typeId === 4 ? 0 : Math.max(0, Math.min(3, Number(typeId) || 0));
   }
 
   function getEggSourceType(typeId) {
     return typeId === 3 ? 1 : 0;
   }
 
+  function getEggTargetHatchWaves(typeId) {
+    switch (typeId) {
+      case 1: return 25;
+      case 2: return 50;
+      case 3: return 100;
+      case 4: return 50;
+      default: return 10;
+    }
+  }
+
+  function getEggFieldValueForType(key, typeId) {
+    if (key === 'tier') return getEggTargetTier(typeId);
+    if (key === 'sourceType') return getEggSourceType(typeId);
+
+    if (key === 'gachaType') return getEggSourceType(typeId);
+    if (key === 'eggType' || key === 'type') return getEggTargetTier(typeId);
+
+    return typeId;
+  }
+
   function makeManaphyEggId() {
-    const now = Math.max(204, Date.now());
-    return Math.ceil(now / 204) * 204;
+    const maxId = EGG_SEED_LIMIT - 204;
+    if (!Number.isFinite(_manaphyEggIdCursor) || _manaphyEggIdCursor < 204 || _manaphyEggIdCursor > maxId) {
+      const seed = 204 + (Date.now() % maxId);
+      _manaphyEggIdCursor = Math.min(maxId, Math.ceil(seed / 204) * 204);
+    } else {
+      _manaphyEggIdCursor += 204;
+      if (_manaphyEggIdCursor > maxId) _manaphyEggIdCursor = 204;
+    }
+    return _manaphyEggIdCursor;
+  }
+
+  function normalizeAddedEggType(egg, typeId) {
+    if (!egg || typeof egg !== 'object') return;
+
+    ['gachaType', 'eggType', 'sourceType', 'type', 'tier'].forEach(key => {
+      if (Object.prototype.hasOwnProperty.call(egg, key)) {
+        egg[key] = getEggFieldValueForType(key, typeId);
+      }
+    });
+
+    if (typeId === 4) {
+      if (Object.prototype.hasOwnProperty.call(egg, 'id')) egg.id = makeManaphyEggId();
+      if (Object.prototype.hasOwnProperty.call(egg, 'species')) egg.species = 0;
+      if (Object.prototype.hasOwnProperty.call(egg, 'hatchWaves')) egg.hatchWaves = getEggTargetHatchWaves(typeId);
+    }
+  }
+
+  function normalizeNewEggsInRange(gd, fromIndex, typeId) {
+    const eggs = gd?.eggs;
+    if (!Array.isArray(eggs)) return;
+    const start = Math.max(0, Number(fromIndex) || 0);
+    for (let i = start; i < eggs.length; i++) {
+      normalizeAddedEggType(eggs[i], typeId);
+    }
   }
 
   function snapshotEggState(gd) {
@@ -474,6 +543,19 @@
     for (let i = eggs.length - 1; i >= 0; i--) {
       if (ids.has(eggs[i]?.id)) eggs.splice(i, 1);
     }
+  }
+
+  function incrementManualEggStats(gd, typeId) {
+    const stats = gd?.gameStats;
+    if (!stats) return;
+    if (typeof stats.eggsPulled === 'number') stats.eggsPulled += 1;
+    if (typeId === 4) {
+      if (typeof stats.manaphyEggsPulled === 'number') stats.manaphyEggsPulled += 1;
+      return;
+    }
+    if (typeId === 1 && typeof stats.rareEggsPulled === 'number') stats.rareEggsPulled += 1;
+    if (typeId === 2 && typeof stats.epicEggsPulled === 'number') stats.epicEggsPulled += 1;
+    if (typeId === 3 && typeof stats.legendaryEggsPulled === 'number') stats.legendaryEggsPulled += 1;
   }
 
   function getEggConstructor(gd) {
@@ -516,6 +598,33 @@
     const EggCtor = getEggConstructor(gd);
     if (!EggCtor) return false;
 
+    if (typeId === 4) {
+      const options = {
+        sourceType: getEggSourceType(typeId),
+        tier: getEggTargetTier(typeId),
+        hatchWaves: getEggTargetHatchWaves(typeId),
+        id: makeManaphyEggId(),
+      };
+
+      let egg = null;
+      try {
+        egg = new EggCtor(options);
+      } catch (_) {
+        try {
+          egg = new EggCtor({ scene: findGameScene(), ...options });
+        } catch (_) {
+          egg = null;
+        }
+      }
+
+      if (!egg) return false;
+      if (!Array.isArray(gd?.eggs)) return false;
+
+      gd.eggs.push(egg);
+      incrementManualEggStats(gd, typeId);
+      return true;
+    }
+
     const options = {
       pulled: true,
       sourceType: getEggSourceType(typeId),
@@ -535,7 +644,13 @@
       }
     }
 
-    return (gd?.eggs?.length ?? 0) > before;
+    const after = gd?.eggs?.length ?? 0;
+    if (after > before) {
+      normalizeNewEggsInRange(gd, before, typeId);
+      return true;
+    }
+
+    return false;
   }
 
   function cloneEggTemplate(egg) {
@@ -552,11 +667,18 @@
 
     const clone = cloneEggTemplate(template);
     ['gachaType', 'eggType', 'sourceType', 'type', 'tier'].forEach(key => {
-      if (Object.prototype.hasOwnProperty.call(clone, key)) clone[key] = typeId === 4 ? 2 : typeId;
+      if (Object.prototype.hasOwnProperty.call(clone, key)) {
+        clone[key] = getEggFieldValueForType(key, typeId);
+      }
     });
 
     if (Object.prototype.hasOwnProperty.call(clone, 'id')) {
       clone.id = typeId === 4 ? makeManaphyEggId() : Date.now() + '-' + Math.random().toString(36).slice(2);
+    }
+
+    if (typeId === 4) {
+      clone.species = 0;
+      clone.hatchWaves = getEggTargetHatchWaves(typeId);
     }
 
     eggs.push(clone);
@@ -595,7 +717,10 @@
           continue;
         }
         const after = gd?.eggs?.length ?? 0;
-        if (after > before) return true;
+        if (after > before) {
+          normalizeNewEggsInRange(gd, before, typeId);
+          return true;
+        }
       }
     }
 
@@ -648,7 +773,7 @@
     if (typeof onProgress === 'function') onProgress(0, target, 0);
 
     for (let i = 0; i < target; i++) {
-      if (tryAddEggWithConstructor(gd, typeId) || tryAddEggWithGameMethod(gd, typeId) || pushEggClone(gd, typeId)) {
+      if (tryAddEggWithConstructor(gd, typeId) || (typeId !== 4 && tryAddEggWithGameMethod(gd, typeId)) || pushEggClone(gd, typeId)) {
         added++;
       } else {
         break;
@@ -1584,8 +1709,6 @@
         const catchBtn = container.querySelector('#pr-catch-all');
         const resetBtn = container.querySelector('#pr-reset-caught');
         let busy = false;
-        const OPERATION_PROGRESS_WEIGHT = 0.8;
-        const ANIMATION_PROGRESS_WEIGHT = 0.2;
         let dexAnimRaf = null;
         let dexAnimating = false;
         let displayedCaught = null;
@@ -1597,16 +1720,14 @@
           statsEl.textContent = caught + ' / ' + total + ' caught';
         }
 
-        function setDexButtonProgress(btn, label, operationPct, animationPct) {
-          const op = Math.max(0, Math.min(100, Number(operationPct) || 0));
-          const anim = Math.max(0, Math.min(100, Number(animationPct) || 0));
-          const combined = Math.round((op * OPERATION_PROGRESS_WEIGHT) + (anim * ANIMATION_PROGRESS_WEIGHT));
-          btn.textContent = label + ' ' + combined + '%';
+        function setDexButtonProgress(btn, label, pct) {
+          const progress = Math.max(0, Math.min(100, Number(pct) || 0));
+          btn.textContent = label + ' ' + progress + '%';
         }
 
-        async function animateDexCounts(targetCaught, targetTotal, onProgress) {
-          const startCaught = displayedCaught ?? targetCaught;
-          const startTotal = displayedTotal ?? targetTotal;
+        async function animateDexCounts(fromCaught, fromTotal, targetCaught, targetTotal, onProgress) {
+          const startCaught = Number.isFinite(fromCaught) ? fromCaught : (displayedCaught ?? targetCaught);
+          const startTotal = Number.isFinite(fromTotal) ? fromTotal : (displayedTotal ?? targetTotal);
           if (typeof onProgress === 'function') onProgress(0);
 
           if (startCaught === targetCaught && startTotal === targetTotal) {
@@ -1619,6 +1740,8 @@
             cancelAnimationFrame(dexAnimRaf);
             dexAnimRaf = null;
           }
+
+          renderDexText(startCaught, startTotal);
 
           const delta = Math.max(
             Math.abs(targetCaught - startCaught),
@@ -1662,28 +1785,23 @@
           if (busy) return;
           const gd = findGameData();
           if (!gd?.dexData) { showToast('⚠️ No game data found', true); return; }
+          const startStats = getDexStats();
 
           setBusyState(true);
           catchBtn.classList.add('pr-loading');
           const origText = catchBtn.textContent;
-          let operationPct = 0;
-          let animationPct = 0;
+          catchBtn.textContent = 'Working…';
 
           try {
-            const result = await catchAllPokemon((_done, _total, pct) => {
-              operationPct = pct;
-              setDexButtonProgress(catchBtn, 'Working…', operationPct, animationPct);
-            });
+            const result = await catchAllPokemon();
             if (result.ok) {
-              operationPct = 100;
-              animationPct = 0;
-              setDexButtonProgress(catchBtn, 'Working…', operationPct, animationPct);
-              const stats = getDexStats();
-              if (stats) {
-                await animateDexCounts(stats.caught, stats.total, (pct) => {
-                  animationPct = pct;
-                  setDexButtonProgress(catchBtn, 'Working…', operationPct, animationPct);
+              const endStats = getDexStats();
+              if (endStats) {
+                await animateDexCounts(startStats?.caught, startStats?.total, endStats.caught, endStats.total, (pct) => {
+                  setDexButtonProgress(catchBtn, 'Working…', pct);
                 });
+              } else {
+                setDexButtonProgress(catchBtn, 'Working…', 100);
               }
               showToast('✅ Caught ' + result.updated + ' Pokémon!');
             } else {
@@ -1703,28 +1821,23 @@
 
           const confirmed = globalThis.confirm('⚠️ Restore Pokémon progress to the default captured state from when this page first connected?');
           if (!confirmed) return;
+          const startStats = getDexStats();
 
           setBusyState(true);
           resetBtn.classList.add('pr-loading');
           const origText = resetBtn.textContent;
-          let operationPct = 0;
-          let animationPct = 0;
+          resetBtn.textContent = 'Restoring…';
 
           try {
-            const result = await restoreDefaultPokemon((_done, _total, pct) => {
-              operationPct = pct;
-              setDexButtonProgress(resetBtn, 'Restoring…', operationPct, animationPct);
-            });
+            const result = await restoreDefaultPokemon();
             if (result.ok) {
-              operationPct = 100;
-              animationPct = 0;
-              setDexButtonProgress(resetBtn, 'Restoring…', operationPct, animationPct);
-              const stats = getDexStats();
-              if (stats) {
-                await animateDexCounts(stats.caught, stats.total, (pct) => {
-                  animationPct = pct;
-                  setDexButtonProgress(resetBtn, 'Restoring…', operationPct, animationPct);
+              const endStats = getDexStats();
+              if (endStats) {
+                await animateDexCounts(startStats?.caught, startStats?.total, endStats.caught, endStats.total, (pct) => {
+                  setDexButtonProgress(resetBtn, 'Restoring…', pct);
                 });
+              } else {
+                setDexButtonProgress(resetBtn, 'Restoring…', 100);
               }
               showToast('✅ Restored default Pokémon state for ' + result.updated + ' entries');
             } else if (result.reason === 'snapshot') {
@@ -1741,6 +1854,7 @@
 
         return function tick() {
           captureDefaultDexSnapshot();
+          if (busy) return;
           const stats = getDexStats();
           if (stats) {
             if (!dexAnimating && (displayedCaught !== stats.caught || displayedTotal !== stats.total)) {

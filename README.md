@@ -6,7 +6,7 @@ A cheat menu for [PokeRogue](https://pokerogue.net) — install via Tampermonkey
 ### 🥚 Eggs
 * **Voucher Counts** — set Regular, Plus, Premium, and Golden vouchers individually, bulk-set to 999, or zero them all out
 * **Remove Egg Limit** — toggle off the 99-egg storage cap so Gacha pulls are never blocked
-* **Give Eggs by Type** — add up to 500 eggs of any type at once
+* **Give Eggs by Type** — add up to 500 eggs of any type at once (Common, Rare, Epic, Legendary, or Manaphy)
 * **Delete All Eggs** — clear your entire egg storage in one click
 
 ### ⚡ Pokémon
